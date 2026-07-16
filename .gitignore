@@ -1,0 +1,7 @@
+node_modules
+auth.json
+.env
+data/*.json
+data/*.txt
+data/events/*.json
+data/captured/*.json

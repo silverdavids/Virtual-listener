@@ -1,0 +1,24 @@
+{
+  "name": "virtual-scraper",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "login": "node login.js",
+    "inspect": "node inspect-network.js",
+    "inspect:timer": "node inspect-timer-style.js",
+    "inspect:layout": "node inspect-layout-style.js",
+    "analyze:feed": "node analyze-feed.js",
+    "map:canonical": "node canonical-market-mapper.js",
+    "auto:sync": "node auto-sync.js",
+    "live:scrape": "node live-scrape.js",
+    "scrape:event": "node scrape-event.js",
+    "scrape:events": "node scrape-event.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}
