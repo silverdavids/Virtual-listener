@@ -103,6 +103,20 @@ const VH_OFFLINE_RETRY_DELAY_MS = parseEnvMilliseconds(process.env.VH_OFFLINE_RE
 const VH_MAX_CONSECUTIVE_FAILURES = parseEnvMilliseconds(process.env.VH_MAX_CONSECUTIVE_FAILURES, 3);
 const VH_BROWSER_CLOSE_TIMEOUT_MS = parseEnvMilliseconds(process.env.VH_BROWSER_CLOSE_TIMEOUT_MS, 10_000);
 const VH_HEALTH_OPERATION_TIMEOUT_MS = Math.min(VH_HEALTH_CHECK_INTERVAL_MS, 10_000);
+const VH_NETWORK_OFFLINE_CONFIRM_MS = parseEnvMilliseconds(process.env.VH_NETWORK_OFFLINE_CONFIRM_MS, 120_000);
+const VH_AUTH_FAILURE_CONFIRM_MS = parseEnvMilliseconds(process.env.VH_AUTH_FAILURE_CONFIRM_MS, 60_000);
+const VH_AUTH_FAILURE_MIN_COUNT = parseEnvInteger(process.env.VH_AUTH_FAILURE_MIN_COUNT, 3);
+const VH_RELOGIN_COOLDOWN_MS = parseEnvMilliseconds(process.env.VH_RELOGIN_COOLDOWN_MS, 180_000);
+const VH_RESULT_GRACE_MS = parseEnvMilliseconds(process.env.VH_RESULT_GRACE_MS, 300_000);
+const VH_RESULT_LEDGER_CHECK_MS = parseEnvMilliseconds(process.env.VH_RESULT_LEDGER_CHECK_MS, 30_000);
+const VH_RESULT_LEDGER_RETENTION_MS = parseEnvMilliseconds(process.env.VH_RESULT_LEDGER_RETENTION_MS, 86_400_000);
+const VH_RESULT_POST_RETRY_MS = parseEnvMilliseconds(process.env.VH_RESULT_POST_RETRY_MS, 60_000);
+const VH_RESULT_POST_MAX_ATTEMPTS = parseEnvInteger(process.env.VH_RESULT_POST_MAX_ATTEMPTS, 10);
+const VH_NETWORK_ERROR_RELOAD_MS = parseEnvMilliseconds(process.env.VH_NETWORK_ERROR_RELOAD_MS, 30_000);
+const VH_NETWORK_ERROR_MAX_RELOADS = parseEnvInteger(process.env.VH_NETWORK_ERROR_MAX_RELOADS, 5);
+const VH_NETWORK_ERROR_RESTART_AFTER_MS = parseEnvMilliseconds(process.env.VH_NETWORK_ERROR_RESTART_AFTER_MS, 600_000);
+const VH_BROWSER_ERROR_CONFIRM_MS = parseEnvMilliseconds(process.env.VH_BROWSER_ERROR_CONFIRM_MS, 30_000);
+const VH_BROWSER_RESTART_COOLDOWN_MS = parseEnvMilliseconds(process.env.VH_BROWSER_RESTART_COOLDOWN_MS, 60_000);
 
 let shutdownRequested = false;
 let shutdownInProgress = false;
@@ -110,8 +124,15 @@ let activeSession = null;
 let browserSessionNumber = 0;
 let browserRestartCount = 0;
 let lastRestartReason = null;
+let lastBrowserErrorRestartAt = 0;
+const resultCompletenessLedger = new Map();
 
 function parseEnvMilliseconds(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseEnvInteger(value, fallback) {
   const parsed = Number.parseInt(value || '', 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
@@ -141,6 +162,111 @@ async function checkHostReachability(url, timeoutMs) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function normalizeInspectableText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function classifyBrowserErrorPage({ url = '', title = '', bodyText = '' } = {}) {
+  const normalizedUrl = String(url || '');
+  const normalizedTitle = normalizeInspectableText(title);
+  const normalizedBody = normalizeInspectableText(bodyText);
+  const combinedText = `${normalizedTitle} ${normalizedBody}`;
+
+  const urlPatterns = [
+    { type: 'neterror', regex: /^about:neterror\b/i },
+    { type: 'certerror', regex: /^about:certerror\b/i },
+    { type: 'blocked', regex: /^about:blocked\b/i },
+  ];
+  const urlMatch = urlPatterns.find(({ regex }) => regex.test(normalizedUrl));
+  if (urlMatch) {
+    return {
+      detected: true,
+      type: urlMatch.type,
+      url: normalizedUrl,
+      title: normalizedTitle,
+      matched: normalizedUrl.split(/[?#]/, 1)[0],
+    };
+  }
+
+  const textPatterns = [
+    { type: 'problem-loading-page', regex: /problem loading page/i, scope: normalizedTitle },
+    { type: 'server-not-found', regex: /server not found/i, scope: combinedText },
+    { type: 'unable-to-connect', regex: /unable to connect/i, scope: combinedText },
+    { type: 'secure-connection-failed', regex: /secure connection failed/i, scope: combinedText },
+  ];
+  const textMatch = textPatterns.find(({ regex, scope }) => regex.test(scope));
+  if (textMatch) {
+    return {
+      detected: true,
+      type: textMatch.type,
+      url: normalizedUrl,
+      title: normalizedTitle,
+      matched: textMatch.type,
+    };
+  }
+
+  return {
+    detected: false,
+    type: null,
+    url: normalizedUrl,
+    title: normalizedTitle,
+    matched: '',
+  };
+}
+
+async function detectBrowserErrorPage(page) {
+  assertUsablePage(page);
+
+  const url = page.url();
+  const [title, bodyText] = await Promise.all([
+    page.title().catch(() => ''),
+    page.locator('body').innerText({ timeout: 1000 }).catch(() => ''),
+  ]);
+
+  return classifyBrowserErrorPage({ url, title, bodyText });
+}
+
+function createBrowserErrorConfirmationState(confirmMs = VH_BROWSER_ERROR_CONFIRM_MS) {
+  return {
+    firstAt: 0,
+    lastSeenAt: 0,
+    signature: '',
+    error: null,
+    lastWarningAt: 0,
+    observe(error, now = Date.now()) {
+      if (!error?.detected) {
+        this.clear();
+        return { detected: false, confirmed: false, durationMs: 0 };
+      }
+
+      const signature = `${error.type || 'unknown'}:${String(error.url || '').split(/[?#]/, 1)[0]}`;
+      if (signature !== this.signature) {
+        this.firstAt = now;
+        this.signature = signature;
+        this.lastWarningAt = 0;
+      }
+      this.lastSeenAt = now;
+      this.error = error;
+
+      const durationMs = now - this.firstAt;
+      return {
+        detected: true,
+        confirmed: durationMs >= confirmMs,
+        durationMs,
+        remainingMs: Math.max(0, confirmMs - durationMs),
+        error,
+      };
+    },
+    clear() {
+      this.firstAt = 0;
+      this.lastSeenAt = 0;
+      this.signature = '';
+      this.error = null;
+      this.lastWarningAt = 0;
+    },
+  };
 }
 
 class BrowserRestartError extends Error {
@@ -943,28 +1069,6 @@ function classifyEventDetailPacket(json, url) {
     const away = matchObj?.i?.a?.b?.b?.a ?? '';
     const matchStatus = matchObj?.c;
 
-    if (eventType === 'RESULTS' || eventType === 'COMPLETED') {
-      console.log({
-        rowKeys: Object.keys(matchRow || {}),
-        rowBKeys: Object.keys(matchRow?.b || {}),
-        hasMatchD: !!matchObj?.d,
-        matchD: matchObj?.d,
-        hasMatchI: !!matchObj?.i,
-        matchIKeys: Object.keys(matchObj?.i || {}),
-        usingResultObject: resultObject,
-      });
-      console.log('RESULT-DEBUG', {
-        eventStatus: eventType,
-        matchStatus,
-        resultObject,
-        homeScore: resultObject?.a,
-        awayScore: resultObject?.b,
-        typeofHome: typeof resultObject?.a,
-        typeofAway: typeof resultObject?.b,
-        hasScore,
-      });
-    }
-
     return {
       index: index + 1,
       providerMatchId: String(matchObj?.a ?? matchObj?.matchId ?? ''),
@@ -986,11 +1090,7 @@ function classifyEventDetailPacket(json, url) {
   ));
   const hasScore = results.some((match) => match.hasScore);
   const isResultCandidate = hasResultEventStatus || hasResultMatchStatus || hasScore;
-  const hasResults = (
-    eventType === 'RESULTS' &&
-    results.length > 0 &&
-    hasScore
-  );
+  const hasResults = hasResultEventStatus && results.length > 0 && hasScore;
 
   return {
     providerEventId,
@@ -1092,13 +1192,369 @@ function logResultScores(packet) {
   });
 }
 
+function normalizeProviderEventId(value) {
+  return String(value ?? '').trim();
+}
+
+function isNumericScore(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function createResultLedgerEntry(providerEventId) {
+  const now = Date.now();
+  return {
+    providerEventId,
+    leagueId: '',
+    leagueName: '',
+    weekNumber: '',
+    firstMatch: '',
+    expectedMatchCount: null,
+    eventSource: '',
+    eventPostedAt: null,
+    eventPostSucceeded: false,
+    eventRegistrationObserved: false,
+    scheduledStartAt: null,
+    scheduledEndAt: null,
+    firstResultSeenAt: null,
+    lastResultSeenAt: null,
+    resultsReceivedAt: null,
+    receivedMatchCount: 0,
+    resultProviderMatchIds: [],
+    resultPostAttemptedAt: null,
+    resultPostSucceededAt: null,
+    resultPostFailedAt: null,
+    resultPostAttempts: 0,
+    lastResultPostError: null,
+    lastResultPayload: null,
+    retryInProgress: false,
+    status: 'EVENT_CAPTURED',
+    lastUpdatedAt: now,
+    lastOverdueLogAt: 0,
+    resultRowsByProviderMatchId: {},
+  };
+}
+
+function getResultLedgerEntry(providerEventId) {
+  const normalizedProviderEventId = normalizeProviderEventId(providerEventId);
+  if (!normalizedProviderEventId) {
+    return null;
+  }
+
+  if (!resultCompletenessLedger.has(normalizedProviderEventId)) {
+    resultCompletenessLedger.set(normalizedProviderEventId, createResultLedgerEntry(normalizedProviderEventId));
+  }
+
+  return resultCompletenessLedger.get(normalizedProviderEventId);
+}
+
+function updateMissingLedgerMetadata(entry, metadata = {}) {
+  if (!entry) return;
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value === null || value === undefined || value === '') continue;
+    if (key === 'expectedMatchCount') {
+      if (!Number.isFinite(entry.expectedMatchCount) || entry.expectedMatchCount <= 0) {
+        entry.expectedMatchCount = value;
+      }
+      continue;
+    }
+    if (!entry[key]) entry[key] = value;
+  }
+  entry.lastUpdatedAt = Date.now();
+}
+
+function getBoardScheduledStartAt(boardPayload) {
+  const startAtMs = toEpochMs(boardPayload?.startTime ?? boardPayload?.events?.[0]?.startTime);
+  return startAtMs ? new Date(startAtMs).toISOString() : null;
+}
+
+function getBoardScheduledEndAt(boardPayload, cycleTiming = null) {
+  const endAtMs = cycleTiming?.endAtMs ?? toEpochMs(boardPayload?.endTime);
+  return endAtMs ? new Date(endAtMs).toISOString() : null;
+}
+
+function registerResultLedgerEventBoard(boardPayload, result = {}, source = FEED_EVENTS_SOURCE) {
+  const providerEventId = normalizeProviderEventId(boardPayload?.providerEventId ?? result.providerEventId);
+  const entry = getResultLedgerEntry(providerEventId);
+  if (!entry) return null;
+
+  const expectedMatchCount = Array.isArray(boardPayload?.events) && boardPayload.events.length > 0
+    ? boardPayload.events.length
+    : null;
+  updateMissingLedgerMetadata(entry, {
+    leagueId: String(boardPayload?.leagueNumber ?? boardPayload?.leagueId ?? ''),
+    leagueName: boardPayload?.leagueName ?? boardPayload?.events?.[0]?.leagueName ?? '',
+    weekNumber: String(boardPayload?.weekNumber ?? ''),
+    firstMatch: boardPayload?.firstMatch ?? '',
+    expectedMatchCount,
+    scheduledStartAt: getBoardScheduledStartAt(boardPayload),
+    scheduledEndAt: getBoardScheduledEndAt(boardPayload, result.cycleTiming),
+  });
+
+  entry.eventSource = source;
+  entry.eventPostedAt = new Date().toISOString();
+  entry.eventPostSucceeded = true;
+  entry.eventRegistrationObserved = true;
+  if (entry.status === 'EVENT_CAPTURED') entry.status = 'EVENT_POSTED';
+  if (!entry.resultsReceivedAt && !entry.resultPostSucceededAt) entry.status = 'AWAITING_RESULTS';
+  entry.lastUpdatedAt = Date.now();
+
+  console.log(
+    `RESULT-LEDGER-REGISTERED providerEventId=${entry.providerEventId} ` +
+      `week=${entry.weekNumber || 'not found'} expected=${entry.expectedMatchCount ?? 'unknown'} ` +
+      `endAt=${entry.scheduledEndAt || 'unknown'} source=${source}`,
+  );
+  return entry;
+}
+
+function registerResultLedgerCanonicalEvents(canonicalEvents, result = {}, source = 'event-detail') {
+  if (!Array.isArray(canonicalEvents) || canonicalEvents.length === 0) return null;
+  const firstEvent = canonicalEvents[0] ?? {};
+  const boardPayload = {
+    providerEventId: result.providerEventId ?? result.eventFeedId ?? firstEvent.providerEventId ?? firstEvent.eventId,
+    leagueNumber: firstEvent.leagueNumber ?? firstEvent.leagueId,
+    leagueId: firstEvent.leagueId,
+    leagueName: firstEvent.leagueName,
+    weekNumber: firstEvent.weekNumber,
+    firstMatch: firstEvent.firstMatch ?? getFirstText(canonicalEvents),
+    startTime: firstEvent.startTime,
+    endTime: result.endTime ?? null,
+    events: canonicalEvents,
+  };
+  return registerResultLedgerEventBoard(boardPayload, result, source);
+}
+
+function getResultPayloadExpectedMatchCount(packet, monitorPayload) {
+  const payloadCount = packet?.resultsPayload?.matches?.length ?? monitorPayload?.matches?.length ?? null;
+  return payloadCount || 10;
+}
+
+function recordResultLedgerObservation(packet, monitorPayload) {
+  const providerEventId = normalizeProviderEventId(packet?.providerEventId ?? monitorPayload?.providerEventId);
+  const entry = getResultLedgerEntry(providerEventId);
+  if (!entry) return null;
+
+  const now = Date.now();
+  if (!entry.eventRegistrationObserved && !entry.firstResultSeenAt) {
+    console.log(
+      `RESULT-LEDGER-PROVISIONAL providerEventId=${providerEventId} ` +
+        `expected=${getResultPayloadExpectedMatchCount(packet, monitorPayload)} reason=result-seen-before-event-registration`,
+    );
+  }
+
+  updateMissingLedgerMetadata(entry, {
+    leagueId: packet?.resultsPayload?.leagueId ?? monitorPayload?.leagueId,
+    leagueName: packet?.resultsPayload?.leagueName ?? monitorPayload?.leagueName,
+    expectedMatchCount: getResultPayloadExpectedMatchCount(packet, monitorPayload),
+    firstMatch: packet?.resultsPayload?.matches?.[0]?.teams,
+  });
+
+  entry.firstResultSeenAt = entry.firstResultSeenAt ?? new Date(now).toISOString();
+  entry.lastResultSeenAt = new Date(now).toISOString();
+  entry.lastResultPayload = monitorPayload;
+
+  (monitorPayload?.matches ?? []).forEach((match) => {
+    const providerMatchId = normalizeProviderEventId(match.providerMatchId);
+    if (!providerMatchId) return;
+    entry.resultRowsByProviderMatchId[providerMatchId] = {
+      providerMatchId,
+      homeScore: match.homeScore,
+      awayScore: match.awayScore,
+      home: match.home,
+      away: match.away,
+      resultCode: match.resultCode,
+    };
+  });
+
+  entry.resultProviderMatchIds = Object.keys(entry.resultRowsByProviderMatchId);
+  entry.receivedMatchCount = entry.resultProviderMatchIds.length;
+  const expected = entry.expectedMatchCount ?? getResultPayloadExpectedMatchCount(packet, monitorPayload);
+  const completeScores = entry.resultProviderMatchIds.every((providerMatchId) => {
+    const row = entry.resultRowsByProviderMatchId[providerMatchId];
+    return providerMatchId && isNumericScore(row?.homeScore) && isNumericScore(row?.awayScore);
+  });
+  const isComplete = entry.receivedMatchCount === expected && completeScores;
+
+  if (isComplete) {
+    entry.resultsReceivedAt = entry.resultsReceivedAt ?? new Date(now).toISOString();
+  } else if (entry.receivedMatchCount > 0) {
+    entry.status = 'PARTIAL_RESULTS';
+  }
+
+  entry.lastUpdatedAt = now;
+  console.log(
+    `RESULT-LEDGER-UPDATE providerEventId=${providerEventId} received=${entry.receivedMatchCount} ` +
+      `expected=${expected} state=${packet?.eventType || 'unknown'}`,
+  );
+  if (!isComplete) {
+    console.log(
+      `RESULT-PARTIAL providerEventId=${providerEventId} expected=${expected} ` +
+        `received=${entry.receivedMatchCount} missing=${Math.max(0, expected - entry.receivedMatchCount)}`,
+    );
+  }
+  return { entry, isComplete, expected };
+}
+
+function markResultPostAttempt(entry) {
+  entry.resultPostAttempts += 1;
+  entry.resultPostAttemptedAt = new Date().toISOString();
+  entry.lastUpdatedAt = Date.now();
+}
+
+function markResultPostSuccess(entry, monitorPayload) {
+  const now = Date.now();
+  entry.resultPostSucceededAt = new Date(now).toISOString();
+  entry.resultPostFailedAt = null;
+  entry.lastResultPostError = null;
+  entry.lastResultPayload = monitorPayload;
+  entry.status = 'RESULTS_COMPLETE';
+  entry.lastUpdatedAt = now;
+  console.log(
+    `RESULT-POST-SUCCESS providerEventId=${entry.providerEventId} ` +
+      `matches=${monitorPayload.matches.length} attempt=${entry.resultPostAttempts}`,
+  );
+  console.log(`RESULT-COMPLETE providerEventId=${entry.providerEventId} expected=${entry.expectedMatchCount ?? monitorPayload.matches.length} received=${entry.receivedMatchCount}`);
+}
+
+function markResultPostFailure(entry, monitorPayload, error) {
+  const now = Date.now();
+  entry.resultPostFailedAt = new Date(now).toISOString();
+  entry.lastResultPostError = safeError(error);
+  entry.lastResultPayload = monitorPayload;
+  entry.status = 'RESULT_POST_FAILED';
+  entry.lastUpdatedAt = now;
+  console.log(
+    `RESULT-POST-FAILED providerEventId=${entry.providerEventId} matches=${monitorPayload.matches.length} ` +
+      `attempt=${entry.resultPostAttempts} error="${entry.lastResultPostError}"`,
+  );
+}
+
+async function postResultMonitorPayloadWithLedger(entry, monitorPayload, { retry = false } = {}) {
+  if (!entry) {
+    return postResultMonitorPayload(monitorPayload);
+  }
+
+  markResultPostAttempt(entry);
+  if (retry) {
+    console.log(`RESULT-POST-RETRY providerEventId=${entry.providerEventId} attempt=${entry.resultPostAttempts}`);
+  }
+
+  try {
+    const monitorResult = await postResultMonitorPayload(monitorPayload);
+    markResultPostSuccess(entry, monitorPayload);
+    return monitorResult;
+  } catch (error) {
+    markResultPostFailure(entry, monitorPayload, error);
+    throw error;
+  }
+}
+
+async function retryResultLedgerPost(entry) {
+  if (!entry || entry.retryInProgress || entry.status !== 'RESULT_POST_FAILED') return;
+  if (!entry.lastResultPayload || entry.resultPostSucceededAt) return;
+  if (entry.resultPostAttempts >= VH_RESULT_POST_MAX_ATTEMPTS) return;
+  const failedAtMs = Date.parse(entry.resultPostFailedAt || '');
+  if (Number.isFinite(failedAtMs) && Date.now() - failedAtMs < VH_RESULT_POST_RETRY_MS) return;
+
+  entry.retryInProgress = true;
+  try {
+    await postResultMonitorPayloadWithLedger(entry, entry.lastResultPayload, { retry: true });
+  } catch {
+    // Failure is recorded by postResultMonitorPayloadWithLedger.
+  } finally {
+    entry.retryInProgress = false;
+  }
+}
+
+function getResultLedgerCounts() {
+  const counts = {
+    tracked: resultCompletenessLedger.size,
+    awaiting: 0,
+    partial: 0,
+    complete: 0,
+    overdue: 0,
+    postFailed: 0,
+  };
+  for (const entry of resultCompletenessLedger.values()) {
+    if (entry.status === 'AWAITING_RESULTS') counts.awaiting += 1;
+    else if (entry.status === 'PARTIAL_RESULTS') counts.partial += 1;
+    else if (entry.status === 'RESULTS_COMPLETE') counts.complete += 1;
+    else if (entry.status === 'RESULTS_OVERDUE') counts.overdue += 1;
+    else if (entry.status === 'RESULT_POST_FAILED') counts.postFailed += 1;
+  }
+  return counts;
+}
+
+function getPendingEndedResultCount(now = Date.now()) {
+  let count = 0;
+  for (const entry of resultCompletenessLedger.values()) {
+    if (!['AWAITING_RESULTS', 'PARTIAL_RESULTS', 'RESULT_POST_FAILED', 'RESULTS_OVERDUE'].includes(entry.status)) continue;
+    const endAtMs = Date.parse(entry.scheduledEndAt || '');
+    if (Number.isFinite(endAtMs) && now > endAtMs + VH_RESULT_GRACE_MS) count += 1;
+  }
+  return count;
+}
+
+async function checkResultCompletenessLedger() {
+  const now = Date.now();
+  for (const [providerEventId, entry] of resultCompletenessLedger.entries()) {
+    if (entry.status === 'RESULTS_COMPLETE') {
+      const succeededAtMs = Date.parse(entry.resultPostSucceededAt || '');
+      if (Number.isFinite(succeededAtMs) && now - succeededAtMs >= VH_RESULT_LEDGER_RETENTION_MS) {
+        resultCompletenessLedger.delete(providerEventId);
+        console.log(`RESULT-LEDGER-REMOVED providerEventId=${providerEventId} reason=retention-expired`);
+      }
+      continue;
+    }
+
+    if (entry.status === 'RESULT_POST_FAILED') {
+      await retryResultLedgerPost(entry);
+    }
+
+    if (!['AWAITING_RESULTS', 'PARTIAL_RESULTS', 'RESULT_POST_FAILED', 'RESULTS_OVERDUE'].includes(entry.status)) {
+      continue;
+    }
+
+    const endAtMs = Date.parse(entry.scheduledEndAt || '');
+    if (!Number.isFinite(endAtMs) || now <= endAtMs + VH_RESULT_GRACE_MS) {
+      continue;
+    }
+
+    const expected = entry.expectedMatchCount ?? 10;
+    const missing = Math.max(0, expected - entry.receivedMatchCount);
+    const endedAgoMs = now - endAtMs;
+    if (entry.status !== 'RESULTS_OVERDUE' || now - entry.lastOverdueLogAt >= VH_RESULT_LEDGER_CHECK_MS * 4) {
+      console.log(
+        `RESULTS-OVERDUE providerEventId=${providerEventId} expected=${expected} ` +
+          `received=${entry.receivedMatchCount} missing=${missing} endedAgoMs=${endedAgoMs}`,
+      );
+      entry.lastOverdueLogAt = now;
+    }
+    if (entry.status !== 'RESULT_POST_FAILED') entry.status = 'RESULTS_OVERDUE';
+    entry.lastUpdatedAt = now;
+  }
+
+  const counts = getResultLedgerCounts();
+  console.log(
+    `RESULT-LEDGER-SUMMARY tracked=${counts.tracked} awaiting=${counts.awaiting} partial=${counts.partial} ` +
+      `complete=${counts.complete} overdue=${counts.overdue} postFailed=${counts.postFailed}`,
+  );
+}
+
 async function processResultMonitorPacket(packet) {
   logResultScores(packet);
   const monitorPayload = buildResultMonitorPayload(packet);
+  const observation = recordResultLedgerObservation(packet, monitorPayload);
   let monitorResult = null;
 
+  if (!observation?.isComplete) {
+    return {
+      monitorPayload,
+      monitorResult,
+    };
+  }
+
   try {
-    monitorResult = await postResultMonitorPayload(monitorPayload);
+    monitorResult = await postResultMonitorPayloadWithLedger(observation.entry, monitorPayload);
     console.log(
       `RESULT-MONITOR-POSTED providerEventId=${monitorPayload.providerEventId || 'not found'} ` +
         `matches=${monitorPayload.matches.length} ok=${monitorResult.ok ?? 'unknown'}`,
@@ -2106,7 +2562,11 @@ function createFeedEventsCapture(page, options = {}) {
           `cycle=${getCycle()} source=${FEED_EVENTS_SOURCE} skipped reason=auth-failure status=${response.status()} ` +
             `${response.statusText()} ${body.slice(0, 500)}`,
         );
-        onAuthenticationFailure(`feed-events-${response.status()}-${body.match(/PlayerNotAuthenticatedException/i)?.[0] ?? 'auth-failed'}`);
+        onAuthenticationFailure({
+          reason: `feed-events-${response.status()}-${body.match(/PlayerNotAuthenticatedException/i)?.[0] ?? 'auth-failed'}`,
+          status: response.status(),
+          url: response.url(),
+        });
         return;
       }
 
@@ -2557,7 +3017,11 @@ function createEventDetailCapture(page, options = {}) {
           domFirst: 'not found',
           feedFirst: 'not found',
         });
-        onAuthenticationFailure(`event-detail-${response.status()}-${body.match(/PlayerNotAuthenticatedException/i)?.[0] ?? 'auth-failed'}`);
+        onAuthenticationFailure({
+          reason: `event-detail-${response.status()}-${body.match(/PlayerNotAuthenticatedException/i)?.[0] ?? 'auth-failed'}`,
+          status: response.status(),
+          url: response.url(),
+        });
         return;
       }
 
@@ -2837,7 +3301,11 @@ function createSessionAuthMonitor(page, options = {}) {
         `cycle=${getCycle()} source=session-auth skipped reason=auth-failure status=${response.status()} ` +
           `${response.statusText()} url=${response.url()}`,
       );
-      onAuthenticationFailure(`balance-${response.status()}`);
+      onAuthenticationFailure({
+        reason: `balance-${response.status()}`,
+        status: response.status(),
+        url: response.url(),
+      });
     }
   };
 
@@ -4747,6 +5215,7 @@ async function postFeedEventsBoard(cycle, boardPayload, lastPostedState, meta = 
     `VIRTUAL-API-POSTED source=${FEED_EVENTS_SOURCE} providerEventId=${boardPayload.providerEventId || 'not found'} ` +
       `week=${boardPayload.weekNumber || 'not found'} firstMatch=${boardPayload.firstMatch || 'not found'}`,
   );
+  registerResultLedgerEventBoard(boardPayload, { ...feedResultMeta, cycleTiming }, FEED_EVENTS_SOURCE);
 
   return {
     posted: true,
@@ -4862,6 +5331,7 @@ async function postCanonicalEventsForSource(cycle, source, canonicalEvents, last
     batchId: result.batchId,
     errors: result.errors ?? [],
   });
+  registerResultLedgerCanonicalEvents(eventsToPost, { ...extra, result }, source);
 
   return {
     posted: true,
@@ -5068,6 +5538,124 @@ async function isLoginPageVisible(page) {
   return Boolean(loginField);
 }
 
+async function inspectLoginPageEvidence(page) {
+  assertUsablePage(page);
+
+  const [usernameField, passwordField] = await Promise.all([
+    getFirstVisibleLocator(page, USERNAME_SELECTORS, 500).catch(() => null),
+    getFirstVisibleLocator(page, PASSWORD_SELECTORS, 500).catch(() => null),
+  ]);
+  const loginButtonVisible = await Promise.any([
+    page.locator('button.shop-login-button').first().isVisible({ timeout: 500 }),
+    page.getByText('LOGIN', { exact: true }).first().isVisible({ timeout: 500 }),
+    page.locator('button').filter({ hasText: /login/i }).first().isVisible({ timeout: 500 }),
+  ]).catch(() => false);
+  const pageState = await page.evaluate(() => {
+    const text = document.body?.innerText || '';
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    const url = window.location.href;
+    return {
+      url,
+      authenticationTextVisible: /\b(?:AUTHENTICATION|LOGIN|USERNAME|PASSWORD)\b/i.test(normalized),
+      authenticatedContentVisible: /\b(?:BALANCE|NO MORE BETS|SKIP TO NEXT GAMES|FOOTBALL|LEAGUE|WEEK)\b/i.test(normalized),
+      textSample: normalized.slice(0, 160),
+    };
+  }).catch(() => ({
+    url: '',
+    authenticationTextVisible: false,
+    authenticatedContentVisible: false,
+    textSample: '',
+  }));
+
+  const usernameVisible = Boolean(usernameField);
+  const passwordVisible = Boolean(passwordField);
+  const strongFieldEvidence = usernameVisible && passwordVisible && loginButtonVisible;
+  const confident = strongFieldEvidence && !pageState.authenticatedContentVisible;
+
+  return {
+    usernameVisible,
+    passwordVisible,
+    loginButtonVisible,
+    authenticationTextVisible: pageState.authenticationTextVisible,
+    authenticatedContentVisible: pageState.authenticatedContentVisible,
+    url: pageState.url,
+    confident,
+  };
+}
+
+function isAuthenticatedShopEvidence(loginEvidence) {
+  if (!loginEvidence || loginEvidence.confident) {
+    return false;
+  }
+
+  try {
+    const currentUrl = new URL(loginEvidence.url || '');
+    if (currentUrl.pathname.endsWith('/client/shop.jsp')) {
+      return true;
+    }
+  } catch {
+    // Fall through to content evidence.
+  }
+
+  return Boolean(loginEvidence.authenticatedContentVisible);
+}
+
+async function isBrowserNetworkErrorPage(page) {
+  assertUsablePage(page);
+
+  const url = page.url();
+  const [title, bodyText] = await Promise.all([
+    page.title().catch(() => ''),
+    page.locator('body').innerText({ timeout: 1000 }).catch(() => ''),
+  ]);
+  const normalizedBody = String(bodyText || '').replace(/\s+/g, ' ');
+  const hasNetworkErrorText = (
+    /server not found/i.test(title) ||
+    /can't connect to the server|can’t connect to the server/i.test(normalizedBody) ||
+    /try again/i.test(normalizedBody)
+  );
+  const hasNormalHorizonContent = /\b(?:BALANCE|NO MORE BETS|SKIP TO NEXT GAMES|FOOTBALL|LEAGUE|WEEK|AUTHENTICATION|LOGIN)\b/i.test(normalizedBody);
+
+  return (
+    String(url || '').startsWith('about:neterror') ||
+    (hasNetworkErrorText && !hasNormalHorizonContent)
+  );
+}
+
+async function detectCurrentBrowserErrorPage(page) {
+  return detectBrowserErrorPage(page);
+}
+
+async function inspectPageState(page) {
+  assertUsablePage(page);
+
+  const [browserError, loginEvidence, visibleFirstMatch, visibleCountdown] = await Promise.all([
+    detectCurrentBrowserErrorPage(page).catch(() => ({ detected: false, type: null, url: page.url(), title: '' })),
+    inspectLoginPageEvidence(page).catch(() => ({ confident: false, authenticatedContentVisible: false })),
+    readVisibleFirstMatch(page).catch(() => null),
+    readVisibleCountdown(page).catch(() => ({ found: false })),
+  ]);
+  const browserErrorPage = Boolean(browserError?.detected);
+  const authenticatedApp = !browserErrorPage && !loginEvidence.confident && (
+    isAuthenticatedShopEvidence(loginEvidence) ||
+    Boolean(visibleFirstMatch) ||
+    Boolean(visibleCountdown?.found)
+  );
+  const loginPage = !browserErrorPage && Boolean(loginEvidence.confident);
+
+  return {
+    browserErrorPage,
+    browserError,
+    loginPage,
+    authenticatedApp,
+    blankOrUnknown: !browserErrorPage && !loginPage && !authenticatedApp,
+    loginEvidence,
+    visibleFirstMatch,
+    visibleCountdown,
+    url: page.url(),
+  };
+}
+
 async function getBalanceAuthStatus(page) {
   assertUsablePage(page);
 
@@ -5096,6 +5684,12 @@ async function getSessionExpiryReason(page, lastEventDetailAt) {
   const visibleRows = await countVisibleFixtureRows(page);
   const balanceStatus = await getBalanceAuthStatus(page);
   const eventDetailAgeMs = Date.now() - lastEventDetailAt;
+
+  const loginEvidence = await inspectLoginPageEvidence(page).catch(() => ({ confident: false }));
+
+  if (loginEvidence.confident) {
+    return 'confirmed-login-form';
+  }
 
   if (await isLoginPageVisible(page)) {
     if (balanceStatus.status === 401 || balanceStatus.status === 403) {
@@ -5780,10 +6374,16 @@ async function runBrowserSession() {
   let resultEventDetailCapture = null;
   let sessionAuthMonitor = null;
   let watchdogInterval = null;
+  let resultLedgerInterval = null;
   let watchdogRunning = false;
+  let resultLedgerCheckRunning = false;
   let cleanupStarted = false;
   let restartRequested = false;
   let restartReason = null;
+  const browserErrorConfirmation = createBrowserErrorConfirmationState(VH_BROWSER_ERROR_CONFIRM_MS);
+  let browserErrorRecoveryRunning = false;
+  let lastPageStateLog = '';
+  let lastPageStateLogAt = 0;
   let resolveRestart;
   const restartSignal = new Promise((resolve) => { resolveRestart = resolve; });
   const sessionStartedAt = Date.now();
@@ -5838,6 +6438,122 @@ async function runBrowserSession() {
 
   logSyncTargets();
 
+  const authFailureState = {
+    reason: null,
+    count: 0,
+    firstAt: 0,
+    lastAt: 0,
+    lastLogAt: 0,
+  };
+  const networkState = {
+    networkOfflineSince: 0,
+    lastNetworkSuccessAt: Date.now(),
+    lastNetworkFailureAt: 0,
+    lastSuccessfulBalanceAt: 0,
+    lastOfflineLogAt: 0,
+  };
+  let lastReloginAt = 0;
+  let authRecoveryRunning = false;
+
+  const getUrlPath = (value) => {
+    try {
+      const parsed = new URL(String(value));
+      return `${parsed.pathname}${parsed.search ? '?' : ''}${parsed.search ? parsed.search.slice(1, 80) : ''}`;
+    } catch {
+      return String(value || '').slice(0, 120);
+    }
+  };
+
+  const isHorizonUrl = (url) => (
+    String(url || '').includes('globalbet.virtual-horizon.com') ||
+    String(url || '').includes('/engine/shop/') ||
+    String(url || '').includes('/client/shop.jsp')
+  );
+
+  const isReliableHorizonSuccess = (response) => {
+    const url = response.url();
+    if (!isHorizonUrl(url)) return false;
+    if (url.includes(BALANCE_URL_MARKER) && response.status() === 405) return true;
+    return response.status() >= 200 && response.status() < 400;
+  };
+
+  const recordNetworkSuccess = (source = 'horizon-response') => {
+    networkState.lastNetworkSuccessAt = Date.now();
+    if (networkState.networkOfflineSince) {
+      console.log(
+        `network-restored source=${source} ` +
+          `offlineDurationMs=${Date.now() - networkState.networkOfflineSince}`,
+      );
+    }
+    networkState.networkOfflineSince = 0;
+    networkState.lastNetworkFailureAt = 0;
+    offlineDetected = false;
+    browserErrorConfirmation.clear();
+  };
+
+  const recordNetworkFailure = (error, source = 'horizon-request') => {
+    const now = Date.now();
+    networkState.lastNetworkFailureAt = now;
+    if (!networkState.networkOfflineSince) {
+      networkState.networkOfflineSince = now;
+    }
+
+    const durationMs = now - networkState.networkOfflineSince;
+    if (durationMs >= VH_NETWORK_OFFLINE_CONFIRM_MS && now - networkState.lastOfflineLogAt >= VH_HEALTH_CHECK_INTERVAL_MS) {
+      networkState.lastOfflineLogAt = now;
+      console.log(`network-offline suspected durationMs=${durationMs} source=${source} error=${safeError(error)}`);
+    }
+  };
+
+  const clearAuthWarnings = (reason) => {
+    if (authFailureState.reason) {
+      console.log(`auth-alarm-cleared reason=${reason} previous=${authFailureState.reason}`);
+    }
+    authFailureState.reason = null;
+    authFailureState.count = 0;
+    authFailureState.firstAt = 0;
+    authFailureState.lastAt = 0;
+    authFailureState.lastLogAt = 0;
+    pendingAuthenticationFailureReason = null;
+  };
+
+  const recordAuthWarning = (details = {}) => {
+    const status = details.status ?? 'unknown';
+    const pathLabel = details.path ?? getUrlPath(details.url);
+    const normalizedReason = String(details.reason || `status-${status}`).slice(0, 120);
+    const now = Date.now();
+    if (authFailureState.reason && now - authFailureState.firstAt <= VH_AUTH_FAILURE_CONFIRM_MS) {
+      authFailureState.count += 1;
+    } else {
+      authFailureState.count = 1;
+      authFailureState.firstAt = now;
+    }
+
+    authFailureState.reason = normalizedReason;
+    authFailureState.lastAt = now;
+    pendingAuthenticationFailureReason = normalizedReason;
+    if (now - authFailureState.lastLogAt >= 5_000 || authFailureState.count <= VH_AUTH_FAILURE_MIN_COUNT) {
+      authFailureState.lastLogAt = now;
+      console.log(`auth-warning count=${authFailureState.count} status=${status} path=${pathLabel}`);
+      if (authFailureState.count < VH_AUTH_FAILURE_MIN_COUNT) {
+        console.log('auth-warning ignored reason=below-threshold');
+      }
+    }
+  };
+
+  const noteAuthenticationFailure = (reason) => {
+    if (reason && typeof reason === 'object') {
+      recordAuthWarning(reason);
+      return;
+    }
+
+    recordAuthWarning({ reason, status: 'unknown', path: reason });
+  };
+
+  const clearAuthenticationFailure = (reason) => {
+    clearAuthWarnings(reason);
+  };
+
   const requestBrowserRestart = (reason, details = {}) => {
     if (shutdownRequested || cleanupStarted || restartRequested) return false;
     restartRequested = true;
@@ -5852,7 +6568,9 @@ async function runBrowserSession() {
     if (cleanupStarted) return;
     cleanupStarted = true;
     if (watchdogInterval) clearInterval(watchdogInterval);
+    if (resultLedgerInterval) clearInterval(resultLedgerInterval);
     watchdogInterval = null;
+    resultLedgerInterval = null;
     console.log('[restart] closing current browser');
     feedEventsCapture?.dispose();
     eventDetailCapture?.dispose();
@@ -5895,14 +6613,48 @@ async function runBrowserSession() {
     context.on('close', onUnexpectedFailure('context-closed'));
     page.on('response', (response) => {
       activity.lastAnyResponseAt = Date.now();
+      if (isReliableHorizonSuccess(response)) {
+        recordNetworkSuccess(getUrlPath(response.url()));
+      }
+      if (response.url().includes(BALANCE_URL_MARKER) && (response.ok() || response.status() === 405)) {
+        const acceptedStatus = response.status();
+        (async () => {
+          const loginEvidence = await inspectLoginPageEvidence(page).catch(() => ({ confident: false }));
+          if (loginEvidence.confident) {
+            recordAuthWarning({
+              reason: 'confirmed-login-form',
+              status: acceptedStatus,
+              path: loginEvidence.url || response.url(),
+            });
+            return;
+          }
+
+          if (acceptedStatus === 405 && !isAuthenticatedShopEvidence(loginEvidence)) {
+            console.log('session-check loginForm=false balanceStatus=405 decision=pending');
+            return;
+          }
+
+          networkState.lastSuccessfulBalanceAt = Date.now();
+          clearAuthWarnings(acceptedStatus === 405 ? 'balance-405-session-valid' : 'balance-ok-session-valid');
+        })().catch((error) => {
+          console.log(`session-check-failed reason=${safeError(error)}`);
+        });
+      }
       if (/\/engine\/shop\/feed\/event\/[^/?#]+/.test(response.url())) {
         activity.lastEventDetailResponseAt = Date.now();
-        if (response.status() === 401 || response.status() === 403) requestBrowserRestart('authentication-expired');
+        if (response.status() === 401 || response.status() === 403) {
+          recordAuthWarning({
+            reason: `event-detail-${response.status()}`,
+            status: response.status(),
+            url: response.url(),
+          });
+        }
       }
     });
     page.on('requestfailed', (request) => {
       if (/\/engine\/shop\/(?:feed\/event(?:s|\/)|account\/balance)|\/client\/shop\.jsp/.test(request.url())) {
         failures.importantNetwork += 1;
+        recordNetworkFailure(request.failure()?.errorText || 'request failed', getUrlPath(request.url()));
       }
     });
     networkTraceRecorder = createNetworkTraceRecorder(page);
@@ -6000,7 +6752,7 @@ async function runBrowserSession() {
             ? `feed-${result.reason}`
             : 'feed-processed';
         if (result?.authExpired) {
-          pendingAuthenticationFailureReason = result.reason ?? 'feed-events-auth-failed';
+          noteAuthenticationFailure(result.reason ?? 'feed-events-auth-failed');
         }
         if (result?.matchesVisible && result.domFirst) {
           lastMatchingFeedDomText = result.domFirst;
@@ -6017,7 +6769,8 @@ async function runBrowserSession() {
         }
       },
       onAuthenticationFailure: (reason) => {
-        pendingAuthenticationFailureReason = reason;
+        if (typeof reason === 'object') recordAuthWarning(reason);
+        else noteAuthenticationFailure(reason);
       },
     });
     eventDetailCapture = createEventDetailCapture(page, {
@@ -6044,7 +6797,7 @@ async function runBrowserSession() {
           lastFeedAction = `event-detail-${result.reason}`;
         }
         if (result?.authExpired) {
-          pendingAuthenticationFailureReason = result.reason ?? 'event-detail-auth-failed';
+          noteAuthenticationFailure(result.reason ?? 'event-detail-auth-failed');
         }
         if (result?.matchesVisible && result.domFirst) {
           lastMatchingFeedDomText = result.domFirst;
@@ -6055,13 +6808,13 @@ async function runBrowserSession() {
         }
       },
       onAuthenticationFailure: (reason) => {
-        pendingAuthenticationFailureReason = reason;
+        noteAuthenticationFailure(reason);
       },
     });
     sessionAuthMonitor = createSessionAuthMonitor(page, {
       getCycle: () => cycle,
       onAuthenticationFailure: (reason) => {
-        pendingAuthenticationFailureReason = reason;
+        noteAuthenticationFailure(reason);
       },
     });
     watchdogInterval = setInterval(async () => {
@@ -6070,37 +6823,91 @@ async function runBrowserSession() {
       try {
         const now = Date.now();
         let pageOk = Boolean(browser?.isConnected() && page && !page.isClosed());
+        let pageHealthState = null;
         if (pageOk) {
           try {
             await promiseWithTimeout(page.evaluate(() => ({ readyState: document.readyState, href: location.href })), VH_HEALTH_OPERATION_TIMEOUT_MS, 'page health');
+            pageHealthState = await promiseWithTimeout(inspectPageState(page), VH_HEALTH_OPERATION_TIMEOUT_MS, 'page state health')
+              .catch(() => null);
             failures.page = 0;
             activity.lastSuccessfulHealthCheckAt = now;
           } catch { failures.page += 1; pageOk = false; }
         } else failures.page += 1;
 
-        try {
+        if (pageHealthState?.browserErrorPage) {
+          logPageState(pageHealthState);
+          recordNetworkFailure('browser network error page', 'watchdog-page-state');
+        } else try {
           const visible = await promiseWithTimeout(readVisibleFirstMatch(page), VH_HEALTH_OPERATION_TIMEOUT_MS, 'DOM read');
           if (visible) { failures.dom = 0; activity.lastDomReadAt = now; } else failures.dom += 1;
         } catch { failures.dom += 1; }
 
         const eventAge = activity.lastEventDetailResponseAt ? now - activity.lastEventDetailResponseAt : now - sessionStartedAt;
         const domAge = now - activity.lastDomReadAt;
+        if (pageHealthState?.browserErrorPage) {
+          const confirmation = browserErrorConfirmation.observe(pageHealthState.browserError, now);
+          const ledgerCounts = getResultLedgerCounts();
+          console.log(
+            `[health] browser=error-page page=${pageHealthState.browserError?.type || 'error'} ` +
+              `auth=unknown provider=offline-confirming api=unknown eventAge=${Math.round(eventAge / 1000)}s ` +
+              `postAge=${activity.lastSuccessfulPostAt ? Math.round((now - activity.lastSuccessfulPostAt) / 1000) + 's' : 'n/a'} ` +
+              `session=${browserSessionNumber} restarts=${browserRestartCount} ` +
+              `resultsPending=${ledgerCounts.awaiting} resultsPartial=${ledgerCounts.partial} ` +
+              `resultsOverdue=${ledgerCounts.overdue} resultPostFailed=${ledgerCounts.postFailed}`,
+          );
+          if (!confirmation.confirmed) {
+            browserErrorConfirmation.lastWarningAt = now;
+            console.log(
+              `browser-error-page confirming type=${pageHealthState.browserError?.type || 'unknown'} ` +
+                `durationMs=${confirmation.durationMs} confirmMs=${VH_BROWSER_ERROR_CONFIRM_MS} ` +
+                `url=${pageHealthState.browserError?.url || 'unknown'} title=${pageHealthState.browserError?.title || 'unknown'}`,
+            );
+          }
+          await recoverBrowserNetworkErrorPage(pageHealthState, 'watchdog-page-state');
+          return;
+        }
         const provider = await checkHostReachability(LOGIN_URL, VH_HEALTH_OPERATION_TIMEOUT_MS);
         const api = await checkHostReachability(PROVIDER_IMPORT_HEALTH_URL, VH_HEALTH_OPERATION_TIMEOUT_MS);
-        offlineDetected = !provider.reachable;
+        if (provider.reachable) {
+          recordNetworkSuccess('provider-health');
+        } else {
+          recordNetworkFailure(provider.error || 'provider unreachable', 'provider-health');
+        }
+        offlineDetected = Boolean(networkState.networkOfflineSince);
         failures.provider = provider.reachable ? 0 : failures.provider + 1;
         failures.eventStale = eventAge >= VH_EVENT_STALE_MS ? failures.eventStale + 1 : 0;
         const healthy = pageOk && failures.dom === 0 && provider.reachable;
         if (healthy) { activity.lastHealthyAt = now; failures.importantNetwork = 0; }
-        console.log(`[health] browser=${browser?.isConnected() ? 'ok' : 'fail'} page=${pageOk ? 'ok' : 'fail'} auth=${pendingAuthenticationFailureReason ? 'fail' : 'ok'} provider=${provider.reachable ? 'ok' : 'fail'} api=${api.reachable ? 'ok' : 'fail'} eventAge=${Math.round(eventAge / 1000)}s postAge=${activity.lastSuccessfulPostAt ? Math.round((now - activity.lastSuccessfulPostAt) / 1000) + 's' : 'n/a'} session=${browserSessionNumber} restarts=${browserRestartCount}`);
-        if (failures.provider >= VH_MAX_CONSECUTIVE_FAILURES) requestBrowserRestart('provider-unreachable', { offline: true });
-        else if (failures.page >= VH_MAX_CONSECUTIVE_FAILURES) requestBrowserRestart('page-unresponsive');
-        else if (failures.dom >= VH_MAX_CONSECUTIVE_FAILURES && domAge >= VH_PAGE_STALE_MS) requestBrowserRestart('dom-stale');
-        else if (failures.eventStale >= VH_MAX_CONSECUTIVE_FAILURES) requestBrowserRestart('event-detail-stale');
+        const ledgerCounts = getResultLedgerCounts();
+        const healthPage = pageHealthState?.browserErrorPage ? 'network-error' : pageOk ? 'ok' : 'fail';
+        const healthAuth = pageHealthState?.browserErrorPage ? 'unknown' : pendingAuthenticationFailureReason ? 'warn' : 'ok';
+        const healthProvider = pageHealthState?.browserErrorPage ? 'offline-or-unknown' : provider.reachable ? 'ok' : 'fail';
+        console.log(`[health] browser=${browser?.isConnected() ? 'ok' : 'fail'} page=${healthPage} auth=${healthAuth} provider=${healthProvider} api=${api.reachable ? 'ok' : 'fail'} eventAge=${Math.round(eventAge / 1000)}s postAge=${activity.lastSuccessfulPostAt ? Math.round((now - activity.lastSuccessfulPostAt) / 1000) + 's' : 'n/a'} session=${browserSessionNumber} restarts=${browserRestartCount} resultsPending=${ledgerCounts.awaiting} resultsPartial=${ledgerCounts.partial} resultsOverdue=${ledgerCounts.overdue} resultPostFailed=${ledgerCounts.postFailed}`);
+        if (failures.page >= VH_MAX_CONSECUTIVE_FAILURES) {
+          requestBrowserRestart('page-unresponsive');
+        } else if (failures.provider >= VH_MAX_CONSECUTIVE_FAILURES) {
+          const offlineDurationMs = networkState.networkOfflineSince ? now - networkState.networkOfflineSince : 0;
+          console.log(`network-offline suspected durationMs=${offlineDurationMs} source=watchdog`);
+        } else if (failures.dom >= VH_MAX_CONSECUTIVE_FAILURES && domAge >= VH_PAGE_STALE_MS) {
+          console.log(`passive-listener-stale eventAgeMs=${eventAge} action=none pendingResults=${getPendingEndedResultCount(now)} source=dom-stale domAgeMs=${domAge}`);
+        } else if (failures.eventStale >= VH_MAX_CONSECUTIVE_FAILURES) {
+          console.log(`passive-listener-stale eventAgeMs=${eventAge} action=none pendingResults=${getPendingEndedResultCount(now)}`);
+        }
       } catch (error) {
         console.log(`[health] check-failed error=${safeError(error)}`);
       } finally { watchdogRunning = false; }
     }, VH_HEALTH_CHECK_INTERVAL_MS);
+    resultLedgerInterval = setInterval(async () => {
+      if (resultLedgerCheckRunning || cleanupStarted) return;
+      resultLedgerCheckRunning = true;
+      try {
+        await checkResultCompletenessLedger();
+      } catch (error) {
+        console.log(`RESULT-LEDGER-CHECK-FAILED error=${safeError(error)}`);
+      } finally {
+        resultLedgerCheckRunning = false;
+      }
+    }, VH_RESULT_LEDGER_CHECK_MS);
   };
   const resetFeedCaptureState = async (reason, options = {}) => {
     const pendingWarmupFeed = options.preservePendingWarmupFeed
@@ -6159,7 +6966,8 @@ async function runBrowserSession() {
     );
   };
   const isLoginRequired = async (reason) => {
-    if (!(await isLoginPageVisible(page).catch(() => false))) {
+    const loginEvidence = await inspectLoginPageEvidence(page).catch(() => ({ confident: false }));
+    if (!loginEvidence.confident && !(await isLoginPageVisible(page).catch(() => false))) {
       return false;
     }
 
@@ -6169,8 +6977,19 @@ async function runBrowserSession() {
       error: error.message || String(error),
     }));
 
+    if (loginEvidence.confident) {
+      console.log(
+        `session-check loginForm=true balanceStatus=${balanceStatus.status ?? 'unknown'} ` +
+          'decision=relogin',
+      );
+      return true;
+    }
+
     if (balanceStatus.ok) {
       console.log(`cycle=${cycle} recovery=login-page-visible ignored reason=balance-ok source=${reason}`);
+      networkState.lastSuccessfulBalanceAt = Date.now();
+      recordNetworkSuccess('balance-ok');
+      clearAuthWarnings('balance-ok-session-valid');
       return false;
     }
 
@@ -6183,7 +7002,17 @@ async function runBrowserSession() {
     }
 
     if (balanceStatus.status === 405) {
+      if (!isAuthenticatedShopEvidence(loginEvidence)) {
+        console.log(
+          `session-check loginForm=false balanceStatus=405 decision=pending source=${reason}`,
+        );
+        return false;
+      }
+
       console.log(`cycle=${cycle} recovery=login-page-visible ignored reason=balance-405 source=${reason}`);
+      networkState.lastSuccessfulBalanceAt = Date.now();
+      recordNetworkSuccess('balance-405');
+      clearAuthWarnings('balance-405-session-valid');
       return false;
     }
 
@@ -6210,7 +7039,253 @@ async function runBrowserSession() {
     );
     return true;
   };
-  const reloginCurrentPage = async (reason) => { requestBrowserRestart(`authentication-expired-${reason}`); };
+  const confirmSessionState = async (reason, options = {}) => {
+    if (!browser?.isConnected?.() || !page || page.isClosed?.()) {
+      console.log(`browser-restart reason=context-unusable source=${reason}`);
+      return { state: 'unusable', reason: 'context-unusable' };
+    }
+
+    try {
+      await promiseWithTimeout(page.evaluate(() => document.readyState), VH_HEALTH_OPERATION_TIMEOUT_MS, 'page auth confirmation');
+    } catch (error) {
+      console.log(`browser-restart reason=context-unusable source=${reason} error=${safeError(error)}`);
+      return { state: 'unusable', reason: 'page-unresponsive' };
+    }
+
+    const balanceStatus = await getBalanceAuthStatus(page).catch((error) => ({
+      ok: false,
+      status: null,
+      error: error.message || String(error),
+    }));
+    const loginEvidence = await inspectLoginPageEvidence(page).catch(() => ({ confident: false }));
+    const loginVisible = loginEvidence.confident || await isLoginPageVisible(page).catch(() => false);
+    const feedAgeMs = lastFeedEvents200At ? Date.now() - lastFeedEvents200At : null;
+    const now = Date.now();
+    const networkOfflineDurationMs = networkState.networkOfflineSince ? now - networkState.networkOfflineSince : 0;
+    const networkOfflineConfirmed = networkOfflineDurationMs >= VH_NETWORK_OFFLINE_CONFIRM_MS;
+
+    if (loginEvidence.confident || options.forceLogin) {
+      recordAuthWarning({
+        reason: 'confirmed-login-form',
+        status: balanceStatus.status ?? 'unknown',
+        path: loginEvidence.url || page.url(),
+      });
+      console.log(
+        `session-check loginForm=true balanceStatus=${balanceStatus.status ?? 'unknown'} ` +
+          'decision=relogin',
+      );
+      return { state: 'expired', reason: 'confirmed-login-form', bypassCooldown: true };
+    }
+
+    const balanceAcceptedAsAuthenticated = (
+      balanceStatus.ok ||
+      (
+        balanceStatus.status === 405 &&
+        !options.ignoreAcceptedBalance405 &&
+        isAuthenticatedShopEvidence(loginEvidence)
+      )
+    );
+
+    if (balanceAcceptedAsAuthenticated) {
+      networkState.lastSuccessfulBalanceAt = now;
+      recordNetworkSuccess(`balance-${balanceStatus.status}`);
+      console.log(`auth-confirm balance=${balanceStatus.status} session=valid`);
+      clearAuthWarnings('session-still-valid');
+      return { state: 'valid', reason: 'balance-valid' };
+    }
+
+    if (balanceStatus.status === 401 || balanceStatus.status === 403) {
+      recordAuthWarning({
+        reason: `balance-${balanceStatus.status}`,
+        status: balanceStatus.status,
+        path: BALANCE_URL_MARKER,
+      });
+    }
+
+    const authThresholdMet = (
+      authFailureState.count >= VH_AUTH_FAILURE_MIN_COUNT &&
+      authFailureState.firstAt &&
+      now - authFailureState.firstAt <= VH_AUTH_FAILURE_CONFIRM_MS
+    );
+    const explicitlyUnauthenticated = balanceStatus.status === 401 || balanceStatus.status === 403;
+    const expired = authThresholdMet && explicitlyUnauthenticated && (loginVisible || networkOfflineConfirmed);
+
+    if (expired) {
+      console.log(
+        `session-expired confirmed reason=${reason} balance=${balanceStatus.status} ` +
+          `loginVisible=${loginVisible} networkOfflineMs=${networkOfflineDurationMs} ` +
+          `authWarnings=${authFailureState.count}`,
+      );
+      return { state: 'expired', reason: 'confirmed-session-expiry' };
+    }
+
+    if (networkState.networkOfflineSince && !networkOfflineConfirmed) {
+      console.log(
+        `network-offline pending durationMs=${networkOfflineDurationMs} ` +
+          `confirmMs=${VH_NETWORK_OFFLINE_CONFIRM_MS} reason=${reason}`,
+      );
+    }
+
+    console.log(
+      `auth-warning ignored reason=session-not-confirmed count=${authFailureState.count}/${VH_AUTH_FAILURE_MIN_COUNT} ` +
+        `balance=${balanceStatus.status ?? 'unknown'} loginVisible=${loginVisible} ` +
+        `networkOfflineMs=${networkOfflineDurationMs} feedAgeMs=${feedAgeMs ?? 'n/a'}`,
+    );
+    return { state: 'pending', reason: 'not-confirmed' };
+  };
+
+  const canAttemptRelogin = (reason, options = {}) => {
+    if (!options.ignoreRecoveryRunning && authRecoveryRunning) {
+      console.log(`relogin-skipped reason=recovery-already-running source=${reason}`);
+      return false;
+    }
+
+    const cooldownRemainingMs = lastReloginAt ? VH_RELOGIN_COOLDOWN_MS - (Date.now() - lastReloginAt) : 0;
+    if (cooldownRemainingMs > 0 && !options.bypassCooldown) {
+      console.log(`relogin-skipped reason=cooldown remainingMs=${cooldownRemainingMs} source=${reason}`);
+      return false;
+    }
+
+    return true;
+  };
+
+  const recoverAuthenticatedSession = async (reason, options = {}) => {
+    const recoveryReason = typeof reason === 'object'
+      ? reason.reason || 'auth-recovery'
+      : reason;
+    const recoveryOptions = typeof reason === 'object'
+      ? { ...reason, ...options }
+      : options;
+
+    if (authRecoveryRunning) {
+      console.log(`relogin-skipped reason=recovery-already-running source=${recoveryReason}`);
+      return;
+    }
+
+    authRecoveryRunning = true;
+    try {
+      const sessionState = await confirmSessionState(recoveryReason, recoveryOptions);
+      if (sessionState.state === 'valid') {
+        console.log('passive-listener-resumed');
+        return;
+      }
+
+      if (sessionState.state === 'pending') {
+        return;
+      }
+
+      if (sessionState.state === 'unusable') {
+        requestBrowserRestart(sessionState.reason || 'context-unusable');
+        return;
+      }
+
+      if (!canAttemptRelogin(recoveryReason, {
+        ignoreRecoveryRunning: true,
+        bypassCooldown: Boolean(recoveryOptions.bypassCooldown || sessionState.bypassCooldown),
+      })) {
+        return;
+      }
+
+      lastReloginAt = Date.now();
+      console.log(`relogin-start reason=${sessionState.reason}`);
+      try {
+        if (recoveryOptions.reloadBeforeLogin && page && !page.isClosed?.()) {
+          await page.reload({ waitUntil: 'domcontentloaded' }).catch((error) => {
+            console.log(`relogin-reload-failed reason=${safeError(error)}`);
+          });
+        }
+        await runConfiguredLogin(page, rl);
+        console.log('relogin-success');
+        clearAuthWarnings('relogin-success');
+        recordNetworkSuccess('relogin-success');
+        await resetFeedCaptureState('after-relogin', {
+          preservePendingWarmupFeed: true,
+          preserveLatestIfCurrentDom: true,
+        });
+        console.log('passive-listener-resumed');
+      } catch (error) {
+        console.log(`relogin-failed reason=${safeError(error)}`);
+        if (!page || page.isClosed?.()) {
+          requestBrowserRestart('context-unusable-after-relogin-failure');
+        }
+      }
+    } finally {
+      authRecoveryRunning = false;
+    }
+  };
+
+  const logPageState = (state, force = false) => {
+    const label = state.browserErrorPage
+      ? `browser-error type=${state.browserError?.type || 'unknown'}`
+      : state.loginPage
+        ? 'login'
+        : state.authenticatedApp
+          ? 'authenticated'
+          : 'blank-or-unknown';
+    const now = Date.now();
+    if (force || label !== lastPageStateLog || now - lastPageStateLogAt >= VH_NETWORK_ERROR_RELOAD_MS) {
+      lastPageStateLog = label;
+      lastPageStateLogAt = now;
+      console.log(`page-state ${label}`);
+    }
+    return label;
+  };
+
+  const recoverBrowserNetworkErrorPage = async (state, reason = 'browser-network-error') => {
+    if (browserErrorRecoveryRunning) {
+      return false;
+    }
+
+    if (!browser?.isConnected?.() || !page || page.isClosed?.()) {
+      requestBrowserRestart('context-unusable-network-error');
+      return true;
+    }
+
+    const now = Date.now();
+    const browserError = state?.browserError?.detected
+      ? state.browserError
+      : await detectCurrentBrowserErrorPage(page).catch(() => ({
+          detected: true,
+          type: 'unknown',
+          url: page?.url?.() || '',
+          title: '',
+        }));
+    const confirmation = browserErrorConfirmation.observe(browserError, now);
+    recordNetworkFailure('browser network error page', reason);
+
+    if (!confirmation.confirmed) {
+      if (now - browserErrorConfirmation.lastWarningAt >= 5_000) {
+        browserErrorConfirmation.lastWarningAt = now;
+        console.log(
+          `browser-error-page confirming type=${browserError.type || 'unknown'} ` +
+            `durationMs=${confirmation.durationMs} confirmMs=${VH_BROWSER_ERROR_CONFIRM_MS} ` +
+            `url=${browserError.url || 'unknown'} title=${browserError.title || 'unknown'}`,
+        );
+      }
+      return true;
+    }
+
+    browserErrorRecoveryRunning = true;
+    try {
+      const cooldownRemainingMs = lastBrowserErrorRestartAt
+        ? Math.max(0, VH_BROWSER_RESTART_COOLDOWN_MS - (now - lastBrowserErrorRestartAt))
+        : 0;
+      lastBrowserErrorRestartAt = now;
+      console.log(
+        `action=restart-browser reason=confirmed-firefox-neterror type=${browserError.type || 'unknown'} ` +
+          `durationMs=${confirmation.durationMs} url=${browserError.url || 'unknown'} ` +
+          `title=${browserError.title || 'unknown'}`,
+      );
+      requestBrowserRestart('confirmed-firefox-neterror', {
+        browserError,
+        delayMs: Math.max(VH_RESTART_DELAY_MS, cooldownRemainingMs),
+      });
+      return true;
+    } finally {
+      browserErrorRecoveryRunning = false;
+    }
+  };
+
   const restartBrowser = async (reason) => {
     requestBrowserRestart(reason);
   };
@@ -6248,27 +7323,65 @@ async function runBrowserSession() {
       cycle += 1;
 
       try {
-        if (pendingAuthenticationFailureReason) {
-          if (pendingAuthenticationFailureReason === 'page-crashed' || page?.isClosed?.()) {
-            await restartBrowser(`auth-failure-${pendingAuthenticationFailureReason}`);
-          } else {
-            await reloginCurrentPage(`auth-failure-${pendingAuthenticationFailureReason}`);
-          }
-          continue;
-        }
-
         if (page?.isClosed?.()) {
           await restartBrowser('page-closed');
           continue;
         }
 
-        if (await isLoginRequired('main-loop')) {
-          await reloginCurrentPage('login-page-visible');
+        const pageState = await inspectPageState(page).catch(() => ({
+          browserErrorPage: false,
+          browserError: { detected: false, type: null, url: page?.url?.() || '', title: '' },
+          loginPage: false,
+          authenticatedApp: false,
+          blankOrUnknown: true,
+          loginEvidence: { confident: false },
+        }));
+        logPageState(pageState);
+        if (pageState.browserErrorPage) {
+          await recoverBrowserNetworkErrorPage(pageState, 'main-loop');
+          continue;
+        }
+        if (pageState.authenticatedApp) {
+          browserErrorConfirmation.clear();
+        }
+
+        if (pendingAuthenticationFailureReason) {
+          if (pendingAuthenticationFailureReason === 'page-crashed' || page?.isClosed?.()) {
+            await restartBrowser(`auth-failure-${pendingAuthenticationFailureReason}`);
+          } else {
+            await recoverAuthenticatedSession(`auth-failure-${pendingAuthenticationFailureReason}`);
+          }
           continue;
         }
 
-        const currentVisibleFirstMatch = await readVisibleFirstMatch(page).catch(() => null);
-        const currentVisibleCountdown = await readVisibleCountdown(page).catch(() => ({ found: false }));
+        const loginEvidence = pageState.loginEvidence ?? { confident: false };
+        if (pageState.loginPage || loginEvidence.confident) {
+          recordAuthWarning({
+            reason: 'confirmed-login-form',
+            status: 'unknown',
+            path: loginEvidence.url || page.url(),
+          });
+          await recoverAuthenticatedSession({
+            reason: 'confirmed-login-form',
+            forceLogin: true,
+            ignoreAcceptedBalance405: true,
+            bypassCooldown: true,
+          });
+          continue;
+        }
+
+        if (await isLoginRequired('main-loop')) {
+          recordAuthWarning({
+            reason: 'login-page-visible',
+            status: 'unknown',
+            path: getUrlPath(page.url()),
+          });
+          await recoverAuthenticatedSession('login-page-visible');
+          continue;
+        }
+
+        const currentVisibleFirstMatch = pageState.visibleFirstMatch ?? await readVisibleFirstMatch(page).catch(() => null);
+        const currentVisibleCountdown = pageState.visibleCountdown ?? await readVisibleCountdown(page).catch(() => ({ found: false }));
         latestVisibleCountdown = currentVisibleCountdown;
         latestVisibleCountdownInitialized = true;
         logVisibleCountdown(cycle, currentVisibleCountdown);
@@ -6536,7 +7649,7 @@ async function runBrowserSession() {
           warmupReleaseVisibleFirstMatch,
         );
         if (warmupReleaseResult?.authExpired) {
-          pendingAuthenticationFailureReason = warmupReleaseResult.reason ?? 'feed-events-auth-failed';
+          noteAuthenticationFailure(warmupReleaseResult.reason ?? 'feed-events-auth-failed');
           continue;
         }
         if (warmupReleaseResult?.posted) {
@@ -6582,7 +7695,11 @@ async function runBrowserSession() {
         console.log(`cycle=${cycle} events=0 batchId= errors=${error.message || error}`);
 
         if (pendingAuthenticationFailureReason || isAuthenticationFailureMessage(error.message || error)) {
-          await reloginCurrentPage(`auth-failure-${pendingAuthenticationFailureReason ?? 'exception'}`);
+          if (!pendingAuthenticationFailureReason) {
+            noteAuthenticationFailure('exception');
+          }
+
+          await recoverAuthenticatedSession(`auth-failure-${pendingAuthenticationFailureReason}`);
           continue;
         }
       }
@@ -6610,7 +7727,7 @@ async function main() {
       await runBrowserSession();
     } catch (error) {
       if (!(error instanceof BrowserRestartError)) console.error(`[session] failure=${safeError(error)}`);
-      delay = error?.details?.offline ? VH_OFFLINE_RETRY_DELAY_MS : VH_RESTART_DELAY_MS;
+      delay = error?.details?.delayMs ?? (error?.details?.offline ? VH_OFFLINE_RETRY_DELAY_MS : VH_RESTART_DELAY_MS);
     }
     if (!shutdownRequested) {
       browserRestartCount += 1;
@@ -6620,9 +7737,18 @@ async function main() {
   }
 }
 
-process.once('SIGINT', () => { shutdown('SIGINT'); });
-process.once('SIGTERM', () => { shutdown('SIGTERM'); });
-process.once('uncaughtException', (error) => { console.error(`[fatal] uncaughtException=${safeError(error)}`); shutdown('uncaughtException', 1); });
-process.once('unhandledRejection', (error) => { console.error(`[fatal] unhandledRejection=${safeError(error)}`); shutdown('unhandledRejection', 1); });
+if (require.main === module) {
+  process.once('SIGINT', () => { shutdown('SIGINT'); });
+  process.once('SIGTERM', () => { shutdown('SIGTERM'); });
+  process.once('uncaughtException', (error) => { console.error(`[fatal] uncaughtException=${safeError(error)}`); shutdown('uncaughtException', 1); });
+  process.once('unhandledRejection', (error) => { console.error(`[fatal] unhandledRejection=${safeError(error)}`); shutdown('unhandledRejection', 1); });
 
-main().catch((error) => { console.error(`[fatal] ${safeError(error)}`); process.exitCode = 1; });
+  main().catch((error) => { console.error(`[fatal] ${safeError(error)}`); process.exitCode = 1; });
+}
+
+module.exports = {
+  classifyBrowserErrorPage,
+  createBrowserErrorConfirmationState,
+  detectBrowserErrorPage,
+  inspectPageState,
+};
