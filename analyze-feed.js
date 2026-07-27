@@ -67,6 +67,19 @@ function getFixtures(feedEvent) {
 function normalizeEvent(feedEvent, fixture) {
   const league = getLeague(feedEvent, fixture);
   const { homeTeam, awayTeam } = getTeams(fixture);
+  const timestampCandidates = {
+    'fixture.f': fixture?.f,
+    'fixture.startTime': fixture?.startTime,
+    'fixture.startAt': fixture?.startAt,
+    'fixture.date': fixture?.date,
+    'fixture.eventTime': fixture?.eventTime,
+    'fixture.scheduledAt': fixture?.scheduledAt,
+    'fixture.kickoff': fixture?.kickoff,
+    'fixture.kickoffTime': fixture?.kickoffTime,
+  };
+  const startTimeSourceField = fixture?.f !== null && fixture?.f !== undefined
+    ? 'fixture.f'
+    : 'fixture.startTime';
 
   return {
     eventId: fixture.a ?? fixture.eventId ?? fixture.id ?? null,
@@ -75,6 +88,8 @@ function normalizeEvent(feedEvent, fixture) {
     homeTeam,
     awayTeam,
     startTime: fixture.f ?? fixture.startTime ?? null,
+    startTimeSourceField,
+    availableCandidateTimestampFields: timestampCandidates,
     markets: normalizeMarkets(fixture),
   };
 }
