@@ -1,12 +1,20 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
+const autoSync = require('./auto-sync');
+
+const {
+  buildResultMonitorPayload,
+  recordResultLedgerObservation,
+  registerResultLedgerEventBoard,
+} = autoSync.__test;
+
 const {
   classifyBrowserErrorPage,
   createBrowserErrorConfirmationState,
   detectBrowserErrorPage,
   inspectPageState,
-} = require('./auto-sync');
+} = autoSync;
 
 function fakeLocator(text = '') {
   return {
@@ -150,4 +158,60 @@ test('error page is never classified as authenticated', async () => {
   assert.equal(state.browserErrorPage, true);
   assert.equal(state.authenticatedApp, false);
   assert.equal(state.loginPage, false);
+});
+
+test('result monitor payload uses matched board leagueNumber and preserves leagueId', () => {
+  const providerEventId = 'result-event-9485';
+  const packet = {
+    providerEventId,
+    resultsPayload: {
+      provider: 'VirtualHorizon',
+      source: 'event-detail-results',
+      providerEventId,
+      leagueId: '21',
+      leagueNumber: '21',
+      leagueName: 'Football League',
+      eventType: 'RESULTS',
+      matches: Array.from({ length: 10 }, (_, index) => ({
+        index: index + 1,
+        providerMatchId: `match-${index + 1}`,
+        home: `Home ${index + 1}`,
+        away: `Away ${index + 1}`,
+        teams: `Home ${index + 1} vs Away ${index + 1}`,
+        hasScore: true,
+        homeScore: index,
+        awayScore: index + 1,
+        resultCode: null,
+      })),
+    },
+  };
+
+  registerResultLedgerEventBoard({
+    providerEventId,
+    leagueId: '21',
+    leagueNumber: '9485',
+    leagueName: 'Football League',
+    weekNumber: '7',
+    firstMatch: 'Home 1 vs Away 1',
+    events: Array.from({ length: 10 }, (_, index) => ({
+      leagueId: '21',
+      leagueNumber: '9485',
+      matchId: `match-${index + 1}`,
+    })),
+  });
+
+const monitorPayload = buildResultMonitorPayload(packet);
+const observation = recordResultLedgerObservation(
+  packet,
+  monitorPayload,
+);
+
+assert.equal(observation.isComplete, true);
+
+  assert.equal(packet.resultsPayload.leagueId, '21');
+  assert.equal(packet.resultsPayload.leagueNumber, '9485');
+  assert.equal(monitorPayload.leagueId, '21');
+  assert.equal(monitorPayload.leagueNumber, '9485');
+  assert.equal(monitorPayload.matches.length, 10);
+  assert.equal(new Set(monitorPayload.matches.map((match) => match.providerMatchId)).size, 10);
 });

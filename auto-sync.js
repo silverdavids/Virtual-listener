@@ -110,6 +110,7 @@ const VH_RELOGIN_COOLDOWN_MS = parseEnvMilliseconds(process.env.VH_RELOGIN_COOLD
 const VH_RESULT_GRACE_MS = parseEnvMilliseconds(process.env.VH_RESULT_GRACE_MS, 300_000);
 const VH_RESULT_LEDGER_CHECK_MS = parseEnvMilliseconds(process.env.VH_RESULT_LEDGER_CHECK_MS, 30_000);
 const VH_RESULT_LEDGER_RETENTION_MS = parseEnvMilliseconds(process.env.VH_RESULT_LEDGER_RETENTION_MS, 86_400_000);
+const VH_RESULT_TRACK_TTL_MS = parseEnvMilliseconds(process.env.VH_RESULT_TRACK_TTL_MS, 900_000);
 const VH_RESULT_POST_RETRY_MS = parseEnvMilliseconds(process.env.VH_RESULT_POST_RETRY_MS, 60_000);
 const VH_RESULT_POST_MAX_ATTEMPTS = parseEnvInteger(process.env.VH_RESULT_POST_MAX_ATTEMPTS, 10);
 const VH_NETWORK_ERROR_RELOAD_MS = parseEnvMilliseconds(process.env.VH_NETWORK_ERROR_RELOAD_MS, 30_000);
@@ -117,6 +118,104 @@ const VH_NETWORK_ERROR_MAX_RELOADS = parseEnvInteger(process.env.VH_NETWORK_ERRO
 const VH_NETWORK_ERROR_RESTART_AFTER_MS = parseEnvMilliseconds(process.env.VH_NETWORK_ERROR_RESTART_AFTER_MS, 600_000);
 const VH_BROWSER_ERROR_CONFIRM_MS = parseEnvMilliseconds(process.env.VH_BROWSER_ERROR_CONFIRM_MS, 30_000);
 const VH_BROWSER_RESTART_COOLDOWN_MS = parseEnvMilliseconds(process.env.VH_BROWSER_RESTART_COOLDOWN_MS, 60_000);
+const PROVIDER_LEAGUE_REGISTRY_TTL_MS = 30 * 60 * 1000;
+const VH_LEAGUE_DISCOVERY_ENABLED = parseEnvBoolean(process.env.VH_LEAGUE_DISCOVERY_ENABLED, false);
+const VH_LEAGUE_DISCOVERY_INTERVAL_MS = parseEnvMilliseconds(process.env.VH_LEAGUE_DISCOVERY_INTERVAL_MS, 300_000);
+const VH_LEAGUE_DISCOVERY_SETTLE_MS = parseEnvMilliseconds(process.env.VH_LEAGUE_DISCOVERY_SETTLE_MS, 1_500);
+const VH_LEAGUE_DISCOVERY_BOARD_TIMEOUT_MS = parseEnvMilliseconds(process.env.VH_LEAGUE_DISCOVERY_BOARD_TIMEOUT_MS, 10_000);
+const VH_LEAGUE_DISCOVERY_MAX_BOARDS_PER_PASS = parseEnvInteger(process.env.VH_LEAGUE_DISCOVERY_MAX_BOARDS_PER_PASS, 10);
+const VH_BOARD_TRANSITION_TIMEOUT_MS = parseEnvMilliseconds(process.env.VH_BOARD_TRANSITION_TIMEOUT_MS, 45_000);
+
+function normalizeIdentityPart(value) {
+  return String(value ?? '').trim();
+}
+
+function getOrderedMatchIdsFromRows(rows) {
+  return normalizeRawResultRows(rows)
+    .map((row) => row?.b ?? row)
+    .map((match) => normalizeIdentityPart(match?.a ?? match?.matchId ?? match?.providerMatchId))
+    .filter(Boolean);
+}
+
+function getOrderedMatchIdsFromMappedMatches(matches) {
+  return (matches ?? [])
+    .map((match) => normalizeIdentityPart(match?.providerMatchId ?? match?.matchId))
+    .filter(Boolean);
+}
+
+function buildVirtualHorizonBoardKey({ leagueId, providerEventId, orderedMatchIds = [] } = {}) {
+  const normalizedLeagueId = normalizeIdentityPart(leagueId);
+  const normalizedProviderEventId = normalizeIdentityPart(providerEventId);
+
+  if (normalizedProviderEventId) {
+    return `VirtualHorizon:${normalizedLeagueId}:${normalizedProviderEventId}`;
+  }
+
+  return `VirtualHorizon:${normalizedLeagueId}:${orderedMatchIds.map(normalizeIdentityPart).filter(Boolean).join(',')}`;
+}
+
+function areOrderedMatchIdsEqual(left = [], right = []) {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => normalizeIdentityPart(value) === normalizeIdentityPart(right[index]));
+}
+
+function getActualLeagueNumberFromRawEvent(event) {
+  const candidates = [
+    event?.f?.b?.c?.e,
+    event?.f?.b?.c?.leagueNumber,
+    event?.leagueNumber,
+    event?.league,
+  ];
+  const found = candidates.find((value) => value !== null && value !== undefined && String(value).trim() !== '');
+  return found === undefined ? '' : String(found);
+}
+
+function createActiveBoardSnapshot(boardPayload, visibleFirstMatch = null) {
+  if (!boardPayload) {
+    return null;
+  }
+
+  const firstMatch = visibleFirstMatch ? getVisibleText(visibleFirstMatch) : boardPayload.firstMatch;
+
+  return {
+    providerEventId: normalizeIdentityPart(boardPayload.providerEventId),
+    boardKey: normalizeIdentityPart(boardPayload.boardKey),
+    leagueId: normalizeIdentityPart(boardPayload.leagueId),
+    leagueNumber: normalizeIdentityPart(visibleFirstMatch?.visibleLeague ?? boardPayload.leagueNumber),
+    weekNumber: normalizeIdentityPart(visibleFirstMatch?.visibleWeek ?? boardPayload.weekNumber),
+    firstMatch,
+    orderedMatchIds: [...(boardPayload.orderedMatchIds ?? [])],
+  };
+}
+
+function shouldUpdateActiveBoardSnapshot(boardPayload, visibleFirstMatch = null) {
+  if (!boardPayload || !visibleFirstMatch) {
+    return false;
+  }
+
+  return getVisibleText(visibleFirstMatch) === boardPayload.firstMatch;
+}
+
+function createPreviousCycleResultWatchFromSnapshot(activeBoardSnapshot, now = Date.now()) {
+  if (!activeBoardSnapshot?.providerEventId) {
+    return {
+      providerEventId: '',
+      boardKey: '',
+      until: 0,
+      activeBoardSnapshot: null,
+    };
+  }
+
+  return {
+    providerEventId: activeBoardSnapshot.providerEventId,
+    boardKey: activeBoardSnapshot.boardKey,
+    until: now + PREVIOUS_CYCLE_RESULT_WATCH_MS,
+    activeBoardSnapshot: {
+      ...activeBoardSnapshot,
+      orderedMatchIds: [...(activeBoardSnapshot.orderedMatchIds ?? [])],
+    },
+  };
+}
 
 let shutdownRequested = false;
 let shutdownInProgress = false;
@@ -126,6 +225,20 @@ let browserRestartCount = 0;
 let lastRestartReason = null;
 let lastBrowserErrorRestartAt = 0;
 const resultCompletenessLedger = new Map();
+const recentResultBoardHistory = new Map();
+const providerLeagueNumberRegistry = new Map();
+let providerLeagueDiscoveryInProgress = false;
+let lastProviderLeagueDiscoveryAt = 0;
+
+const BOARD_PHASES = {
+  ACTIVE: 'ACTIVE',
+  TRANSITION: 'TRANSITION',
+  AWAITING_FEED: 'AWAITING_FEED',
+  AWAITING_RESULTS: 'AWAITING_RESULTS',
+  RESULTS: 'RESULTS',
+  COMPLETED: 'COMPLETED',
+  STALE: 'STALE',
+};
 
 function parseEnvMilliseconds(value, fallback) {
   const parsed = Number.parseInt(value || '', 10);
@@ -379,6 +492,10 @@ function normalizeMatchToken(value) {
   return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
+function normalizeBoardIdentityText(value) {
+  return normalizeMatchToken(value);
+}
+
 function getFeedDiscoveryEvents(feed) {
   return values(feed.events)
     .flatMap((feedEvent) => getFixtures(feedEvent).map((fixture) => {
@@ -495,12 +612,14 @@ function mapFeedMatch(row, boardMeta) {
     provider: 'VirtualHorizon',
     providerEventId: String(boardMeta.providerEventId ?? ''),
     eventId: String(boardMeta.providerEventId ?? ''),
+    boardKey: boardMeta.boardKey,
     matchId: String(match?.a ?? ''),
     sport: 'FOOTBALL',
-    leagueId: String(boardMeta.leagueNumber ?? ''),
+    leagueId: String(boardMeta.providerLeagueId ?? boardMeta.leagueNumber ?? ''),
     leagueNumber: String(boardMeta.leagueNumber ?? ''),
     providerLeagueId: String(boardMeta.providerLeagueId ?? ''),
     leagueName: boardMeta.leagueName,
+    weekNumber: boardMeta.weekNumber,
     homeTeam,
     awayTeam,
     startTime: toFeedIsoTime(match?.f || boardMeta.startTime),
@@ -518,20 +637,30 @@ function parseFeedEventsBoardFromBoard(board) {
   const firstMatch = matches[0]?.b ?? matches[0] ?? {};
   const firstTeams = firstMatch?.i?.a?.b ?? {};
   const providerLeagueId = board?.f?.b?.a?.a?.d ?? board?.f?.b?.a?.d ?? null;
-  const leagueNumber = board?.f?.b?.c?.e || providerLeagueId || null;
+  const leagueNumber = getActualLeagueNumberFromRawEvent(board) || null;
   const weekNumber = board?.f?.b?.c?.a ?? null;
+  const orderedMatchIds = getOrderedMatchIdsFromRows(matches);
+  const providerEventId = String(board?.a ?? '');
+  const normalizedLeagueId = providerLeagueId === null || providerLeagueId === undefined ? '' : String(providerLeagueId);
+  const normalizedLeagueNumber = leagueNumber === null || leagueNumber === undefined ? '' : String(leagueNumber);
   const boardMeta = {
     source: FEED_EVENTS_SOURCE,
     provider: 'VirtualHorizon',
-    providerEventId: String(board?.a ?? ''),
+    providerEventId,
     leagueName: board?.f?.b?.a?.a?.a ?? board?.f?.b?.a?.a ?? null,
     providerLeagueId: providerLeagueId === null || providerLeagueId === undefined ? null : String(providerLeagueId),
     weekNumber: weekNumber === null || weekNumber === undefined ? null : String(weekNumber),
-    leagueNumber: leagueNumber === null || leagueNumber === undefined ? null : String(leagueNumber),
+    leagueNumber: normalizedLeagueNumber || normalizedLeagueId || null,
     startTime: board?.d ?? null,
     endTime: board?.e ?? board?.endTime ?? board?.finishTime ?? null,
     countdownSeconds: toCycleSeconds(board?.countdown ?? board?.countdownSeconds ?? board?.remainingSeconds ?? board?.remainingTime),
     firstMatch: `${firstTeams?.a?.a ?? ''} vs ${firstTeams?.b?.a ?? ''}`,
+    orderedMatchIds,
+    boardKey: buildVirtualHorizonBoardKey({
+      leagueId: normalizedLeagueId,
+      providerEventId,
+      orderedMatchIds,
+    }),
   };
 
   const events = matches
@@ -540,7 +669,7 @@ function parseFeedEventsBoardFromBoard(board) {
 
   return {
     ...boardMeta,
-    leagueId: String(boardMeta.leagueNumber ?? ''),
+    leagueId: String(boardMeta.providerLeagueId ?? boardMeta.leagueNumber ?? ''),
     events,
   };
 }
@@ -636,12 +765,14 @@ function mapFeedQueueMatch(event) {
   return {
     providerEventId: event.providerEventId,
     eventId: event.eventId,
+    boardKey: event.boardKey,
     matchId: event.matchId,
     sport: event.sport,
     leagueId: event.leagueId,
     leagueNumber: event.leagueNumber,
     providerLeagueId: event.providerLeagueId,
     leagueName: event.leagueName,
+    weekNumber: event.weekNumber,
     homeTeam: event.homeTeam,
     awayTeam: event.awayTeam,
     startTime: event.startTime,
@@ -650,25 +781,538 @@ function mapFeedQueueMatch(event) {
   };
 }
 
-function buildFeedEventsQueuePayload(boardPayloads, capturedAt) {
+function getProviderLeagueRegistryKey(type, value) {
+  const normalizedValue = normalizeIdentityPart(value);
+  return normalizedValue ? `${type}:${normalizedValue}` : '';
+}
+
+function getProviderLeagueRegistryKeys({ providerEventId, boardKey } = {}) {
+  return [
+    getProviderLeagueRegistryKey('providerEventId', providerEventId),
+    getProviderLeagueRegistryKey('boardKey', boardKey),
+  ].filter(Boolean);
+}
+
+function pruneProviderLeagueNumberRegistry(now = Date.now()) {
+  for (const [key, entry] of providerLeagueNumberRegistry.entries()) {
+    if (!entry?.updatedAt || now - entry.updatedAt > PROVIDER_LEAGUE_REGISTRY_TTL_MS) {
+      providerLeagueNumberRegistry.delete(key);
+    }
+  }
+}
+
+function registerProviderLeagueNumber(packetOrPayload, now = Date.now()) {
+  const payload = packetOrPayload?.resultsPayload ?? packetOrPayload ?? {};
+  const leagueNumber = normalizeIdentityPart(payload.leagueNumber);
+  const numericLeagueNumber = Number(leagueNumber);
+  const keys = getProviderLeagueRegistryKeys(payload);
+
+  pruneProviderLeagueNumberRegistry(now);
+  if (!Number.isFinite(numericLeagueNumber) || numericLeagueNumber <= 100 || keys.length === 0) {
+    return null;
+  }
+
+  const entry = {
+    leagueNumber,
+    providerEventId: normalizeIdentityPart(payload.providerEventId),
+    boardKey: normalizeIdentityPart(payload.boardKey),
+    firstMatch: normalizeIdentityPart(payload.firstMatch),
+    weekNumber: normalizeIdentityPart(payload.weekNumber),
+    updatedAt: now,
+  };
+
+  keys.forEach((key) => {
+    providerLeagueNumberRegistry.set(key, entry);
+  });
+  console.log(
+    `[LEAGUE-REGISTRY] providerEventId=${entry.providerEventId || 'not found'} ` +
+      `boardKey=${entry.boardKey || 'not found'} leagueNumber=${entry.leagueNumber || 'not found'} ` +
+      `weekNumber=${entry.weekNumber || 'not found'}`,
+  );
+
+  return entry;
+}
+
+function isValidProviderLeagueNumber(value) {
+  const numericValue = Number(normalizeIdentityPart(value));
+  return Number.isFinite(numericValue) && numericValue > 100;
+}
+
+function getProviderLeagueRegistryDebugKeys() {
+  return Array.from(providerLeagueNumberRegistry.keys())
+    .map((key) => key.replace(/^providerEventId:/, 'providerEventId=').replace(/^boardKey:/, 'boardKey='));
+}
+
+function findRegisteredLeagueNumber(boardPayload, now = Date.now(), { logLookup = false } = {}) {
+  pruneProviderLeagueNumberRegistry(now);
+
+  const requestedProviderEventId = normalizeIdentityPart(boardPayload?.providerEventId);
+  const requestedBoardKey = normalizeIdentityPart(boardPayload?.boardKey);
+  const providerEventIdKey = getProviderLeagueRegistryKey('providerEventId', boardPayload?.providerEventId);
+  if (providerEventIdKey && providerLeagueNumberRegistry.has(providerEventIdKey)) {
+    const entry = providerLeagueNumberRegistry.get(providerEventIdKey);
+    if (logLookup) {
+      console.log(
+        `[LEAGUE-REGISTRY-LOOKUP] requestedProviderEventId=${requestedProviderEventId || 'not found'} ` +
+          `requestedBoardKey=${requestedBoardKey || 'not found'} hit=true matchedBy=providerEventId ` +
+          `leagueNumber=${entry.leagueNumber || 'not found'}`,
+      );
+    }
+    return {
+      entry,
+      registryHit: true,
+      matchedBy: 'providerEventId',
+      requestedProviderEventId,
+      requestedBoardKey,
+    };
+  }
+
+  const boardKey = getProviderLeagueRegistryKey('boardKey', boardPayload?.boardKey);
+  if (boardKey && providerLeagueNumberRegistry.has(boardKey)) {
+    const entry = providerLeagueNumberRegistry.get(boardKey);
+    if (logLookup) {
+      console.log(
+        `[LEAGUE-REGISTRY-LOOKUP] requestedProviderEventId=${requestedProviderEventId || 'not found'} ` +
+          `requestedBoardKey=${requestedBoardKey || 'not found'} hit=true matchedBy=boardKey ` +
+          `leagueNumber=${entry.leagueNumber || 'not found'}`,
+      );
+    }
+    return {
+      entry,
+      registryHit: true,
+      matchedBy: 'boardKey',
+      requestedProviderEventId,
+      requestedBoardKey,
+    };
+  }
+
+  if (logLookup) {
+    console.log(
+      `[LEAGUE-REGISTRY-LOOKUP] requestedProviderEventId=${requestedProviderEventId || 'not found'} ` +
+        `requestedBoardKey=${requestedBoardKey || 'not found'} hit=false`,
+    );
+    console.log(`[LEAGUE-REGISTRY-KEYS] ${getProviderLeagueRegistryDebugKeys().join(',') || 'empty'}`);
+  }
+
+  return {
+    entry: null,
+    registryHit: false,
+    matchedBy: '',
+    requestedProviderEventId,
+    requestedBoardKey,
+  };
+}
+
+function lookupProviderLeagueNumber(boardPayload, now = Date.now()) {
+  return findRegisteredLeagueNumber(boardPayload, now).entry;
+}
+
+function getRegistryMissingQueueBoards(boardPayloads, options = {}) {
+  const now = options.now ?? Date.now();
+  const maxBoards = options.maxBoards ?? Number.MAX_SAFE_INTEGER;
+
+  if (!Array.isArray(boardPayloads)) {
+    return [];
+  }
+
+  return boardPayloads
+    .filter((boardPayload) => {
+      if (!boardPayload) {
+        return false;
+      }
+
+      const registryEntry = lookupProviderLeagueNumber(boardPayload, now);
+      return !isValidProviderLeagueNumber(registryEntry?.leagueNumber);
+    })
+    .slice(0, maxBoards);
+}
+
+function normalizeDiscoveryText(value) {
+  return normalizeIdentityPart(value).replace(/\s+/g, ' ').toUpperCase();
+}
+
+function doesActiveSnapshotMatchQueueBoard(activeSnapshot, boardPayload) {
+  if (!activeSnapshot || !boardPayload) {
+    return false;
+  }
+
+  const snapshotProviderEventId = normalizeIdentityPart(activeSnapshot.providerEventId);
+  const boardProviderEventId = normalizeIdentityPart(boardPayload.providerEventId);
+  if (snapshotProviderEventId && boardProviderEventId) {
+    return snapshotProviderEventId === boardProviderEventId;
+  }
+
+  const snapshotWeek = normalizeIdentityPart(activeSnapshot.weekNumber);
+  const boardWeek = normalizeIdentityPart(boardPayload.weekNumber);
+  const snapshotFirst = normalizeDiscoveryText(activeSnapshot.firstMatch);
+  const boardFirst = normalizeDiscoveryText(boardPayload.firstMatch);
+  const snapshotLeagueId = normalizeIdentityPart(activeSnapshot.leagueId);
+  const boardLeagueId = normalizeIdentityPart(boardPayload.leagueId ?? boardPayload.providerLeagueId);
+
+  return Boolean(
+    snapshotWeek &&
+      boardWeek &&
+      snapshotWeek === boardWeek &&
+      snapshotFirst &&
+      boardFirst &&
+      snapshotFirst === boardFirst &&
+      snapshotLeagueId &&
+      boardLeagueId &&
+      snapshotLeagueId === boardLeagueId
+  );
+}
+
+function canRunProviderLeagueDiscovery(state = {}) {
+  if ((state.enabled ?? VH_LEAGUE_DISCOVERY_ENABLED) === false) return false;
+  if (state.discoveryInProgress) return false;
+  if (state.shutdownRequested) return false;
+  if (state.authRecovering || state.loginRequired || state.reloginInProgress) return false;
+  if (state.browserUnhealthy || state.pageUnhealthy || state.providerUnhealthy || state.apiUnhealthy) return false;
+  if (state.criticalNavigationActive) return false;
+
+  const now = state.now ?? Date.now();
+  const lastRunAt = state.lastRunAt ?? 0;
+  const intervalMs = state.intervalMs ?? VH_LEAGUE_DISCOVERY_INTERVAL_MS;
+  return !lastRunAt || now - lastRunAt >= intervalMs;
+}
+
+function createObservedDomBoard(visibleFirstMatch, observedAt = Date.now()) {
+  if (!visibleFirstMatch) {
+    return null;
+  }
+
+  return {
+    firstMatch: getVisibleText(visibleFirstMatch),
+    weekNumber: normalizeIdentityPart(visibleFirstMatch.visibleWeek),
+    leagueId: normalizeIdentityPart(visibleFirstMatch.leagueId ?? visibleFirstMatch.providerLeagueId ?? '21'),
+    leagueNumber: normalizeIdentityPart(visibleFirstMatch.visibleLeague),
+    countdownSeconds: visibleFirstMatch.countdownSeconds ?? null,
+    observedAt,
+  };
+}
+
+function createConfirmedFeedBoard(boardPayload, capturedAt = Date.now()) {
+  if (!boardPayload) {
+    return null;
+  }
+
+  const endAt = toQueueIsoTime(boardPayload.endTime);
+  return {
+    providerEventId: normalizeIdentityPart(boardPayload.providerEventId),
+    boardKey: normalizeIdentityPart(boardPayload.boardKey),
+    firstMatch: normalizeIdentityPart(boardPayload.firstMatch),
+    weekNumber: normalizeIdentityPart(boardPayload.weekNumber),
+    leagueId: normalizeIdentityPart(boardPayload.leagueId ?? boardPayload.providerLeagueId),
+    startAt: toQueueIsoTime(boardPayload.startTime),
+    endAt,
+    nextRefreshAt: endAt,
+    capturedAt,
+  };
+}
+
+function createInitialBoardState(now = Date.now()) {
+  return {
+    observedDomBoard: null,
+    confirmedFeedBoard: null,
+    previousConfirmedFeedBoard: null,
+    transitionTarget: null,
+    currentBoardState: {
+      phase: BOARD_PHASES.STALE,
+      providerEventId: '',
+      firstMatch: '',
+      weekNumber: '',
+      leagueId: '',
+      enteredAt: now,
+      reason: 'initial',
+    },
+  };
+}
+
+function logBoardState(state, reason = '') {
+  const current = state.currentBoardState ?? {};
+  if (current.phase === BOARD_PHASES.TRANSITION) {
+    const previous = state.previousConfirmedFeedBoard ?? state.confirmedFeedBoard ?? {};
+    const observed = state.observedDomBoard ?? {};
+    console.log(
+      `[BOARD-STATE] phase=TRANSITION oldProviderEventId=${previous.providerEventId || 'not found'} ` +
+        `oldFirstMatch="${previous.firstMatch || 'not found'}" observedFirstMatch="${observed.firstMatch || 'not found'}" ` +
+        `observedWeek=${observed.weekNumber || 'not found'} reason=${current.reason || reason || 'transition'}`,
+    );
+    return;
+  }
+
+  console.log(
+    `[BOARD-STATE] phase=${current.phase || 'UNKNOWN'} providerEventId=${current.providerEventId || 'not found'} ` +
+      `firstMatch="${current.firstMatch || 'not found'}" week=${current.weekNumber || 'not found'} ` +
+      `reason=${current.reason || reason || 'unknown'}`,
+  );
+}
+
+function promoteBoardStateToActive(state, boardPayload, capturedAt = Date.now(), reason = 'feed-confirmed') {
+  const confirmedFeedBoard = createConfirmedFeedBoard(boardPayload, capturedAt);
+  if (!confirmedFeedBoard) {
+    return state;
+  }
+
+  state.confirmedFeedBoard = confirmedFeedBoard;
+  state.previousConfirmedFeedBoard = null;
+  state.transitionTarget = null;
+  state.currentBoardState = {
+    phase: BOARD_PHASES.ACTIVE,
+    providerEventId: confirmedFeedBoard.providerEventId,
+    firstMatch: confirmedFeedBoard.firstMatch,
+    weekNumber: confirmedFeedBoard.weekNumber,
+    leagueId: confirmedFeedBoard.leagueId,
+    enteredAt: capturedAt,
+    reason,
+  };
+  logBoardState(state, reason);
+  return state;
+}
+
+function boardFeedMatchesObservedDom(boardPayload, observedDomBoard) {
+  if (!boardPayload || !observedDomBoard) {
+    return false;
+  }
+
+  const feedFirst = normalizeBoardIdentityText(boardPayload.firstMatch);
+  const domFirst = normalizeBoardIdentityText(observedDomBoard.firstMatch);
+  const feedWeek = normalizeIdentityPart(boardPayload.weekNumber);
+  const domWeek = normalizeIdentityPart(observedDomBoard.weekNumber);
+  const feedLeagueId = normalizeIdentityPart(boardPayload.leagueId ?? boardPayload.providerLeagueId);
+  const domLeagueId = normalizeIdentityPart(observedDomBoard.leagueId || feedLeagueId);
+
+  return Boolean(
+    feedFirst &&
+      domFirst &&
+      feedFirst === domFirst &&
+      feedLeagueId &&
+      domLeagueId &&
+      feedLeagueId === domLeagueId &&
+      (!feedWeek || !domWeek || feedWeek === domWeek)
+  );
+}
+
+function findTransitionTargetFromQueue(observedDomBoard, boardPayloads = []) {
+  if (!observedDomBoard || !Array.isArray(boardPayloads)) {
+    return null;
+  }
+
+  const domFirst = normalizeBoardIdentityText(observedDomBoard.firstMatch);
+  const domWeek = normalizeIdentityPart(observedDomBoard.weekNumber);
+  const domLeagueId = normalizeIdentityPart(observedDomBoard.leagueId);
+  if (!domFirst || !domLeagueId) {
+    return null;
+  }
+
+  const strong = boardPayloads.find((boardPayload) => (
+    normalizeBoardIdentityText(boardPayload?.firstMatch) === domFirst &&
+    normalizeIdentityPart(boardPayload?.weekNumber) === domWeek &&
+    normalizeIdentityPart(boardPayload?.leagueId ?? boardPayload?.providerLeagueId) === domLeagueId
+  ));
+  const fallback = strong ?? boardPayloads.find((boardPayload) => (
+    normalizeBoardIdentityText(boardPayload?.firstMatch) === domFirst &&
+    normalizeIdentityPart(boardPayload?.leagueId ?? boardPayload?.providerLeagueId) === domLeagueId
+  ));
+
+  if (!fallback) {
+    return null;
+  }
+
+  return {
+    providerEventId: normalizeIdentityPart(fallback.providerEventId),
+    boardKey: normalizeIdentityPart(fallback.boardKey),
+    firstMatch: normalizeIdentityPart(fallback.firstMatch),
+    weekNumber: normalizeIdentityPart(fallback.weekNumber),
+    leagueId: normalizeIdentityPart(fallback.leagueId ?? fallback.providerLeagueId),
+    detectedAt: Date.now(),
+  };
+}
+
+function enterBoardTransition(state, observedDomBoard, boardPayloads = [], reason = 'dom-ahead-of-feed', now = Date.now()) {
+  if (!state || !observedDomBoard) {
+    return state;
+  }
+
+  const confirmed = state.confirmedFeedBoard;
+  if (!confirmed) {
+    state.observedDomBoard = observedDomBoard;
+    return state;
+  }
+
+  const sameFirst = normalizeBoardIdentityText(observedDomBoard.firstMatch) === normalizeBoardIdentityText(confirmed.firstMatch);
+  const sameLeague = !observedDomBoard.leagueId || !confirmed.leagueId || observedDomBoard.leagueId === confirmed.leagueId;
+  if (sameFirst && sameLeague) {
+    return state;
+  }
+
+  state.observedDomBoard = observedDomBoard;
+  state.previousConfirmedFeedBoard = confirmed;
+  state.transitionTarget = findTransitionTargetFromQueue(observedDomBoard, boardPayloads);
+  state.currentBoardState = {
+    phase: BOARD_PHASES.TRANSITION,
+    providerEventId: confirmed.providerEventId,
+    firstMatch: observedDomBoard.firstMatch,
+    weekNumber: observedDomBoard.weekNumber,
+    leagueId: observedDomBoard.leagueId,
+    enteredAt: now,
+    reason,
+  };
+  logBoardState(state, reason);
+  if (state.transitionTarget) {
+    console.log(
+      `[BOARD-STATE] transition-target providerEventId=${state.transitionTarget.providerEventId || 'not found'} ` +
+        `firstMatch="${state.transitionTarget.firstMatch || 'not found'}"`,
+    );
+  }
+  return state;
+}
+
+function confirmBoardTransitionFromFeed(state, boardPayload, capturedAt = Date.now()) {
+  if (!state || state.currentBoardState?.phase !== BOARD_PHASES.TRANSITION || !boardPayload) {
+    return false;
+  }
+
+  const target = state.transitionTarget;
+  const matchesTarget = target
+    ? (
+      (target.providerEventId && target.providerEventId === normalizeIdentityPart(boardPayload.providerEventId)) ||
+        (
+          normalizeBoardIdentityText(target.firstMatch) === normalizeBoardIdentityText(boardPayload.firstMatch) &&
+          normalizeIdentityPart(target.leagueId) === normalizeIdentityPart(boardPayload.leagueId ?? boardPayload.providerLeagueId) &&
+          (!target.weekNumber || target.weekNumber === normalizeIdentityPart(boardPayload.weekNumber))
+        )
+    )
+    : boardFeedMatchesObservedDom(boardPayload, state.observedDomBoard);
+
+  if (!matchesTarget) {
+    return false;
+  }
+
+  console.log(`[BOARD-STATE] transition-confirmed providerEventId=${boardPayload.providerEventId || 'not found'}`);
+  promoteBoardStateToActive(state, boardPayload, capturedAt, 'feed-confirmed-transition');
+  return true;
+}
+
+function checkBoardTransitionTimeout(state, now = Date.now(), timeoutMs = VH_BOARD_TRANSITION_TIMEOUT_MS) {
+  if (!state || state.currentBoardState?.phase !== BOARD_PHASES.TRANSITION) {
+    return false;
+  }
+
+  if (now - state.currentBoardState.enteredAt < timeoutMs) {
+    return false;
+  }
+
+  console.log(
+    `[BOARD-STATE] transition-timeout observedFirstMatch="${state.observedDomBoard?.firstMatch || 'not found'}" ` +
+      `previousProviderEventId=${state.previousConfirmedFeedBoard?.providerEventId || state.confirmedFeedBoard?.providerEventId || 'not found'}`,
+  );
+  state.currentBoardState = {
+    ...state.currentBoardState,
+    phase: BOARD_PHASES.STALE,
+    reason: 'transition-timeout',
+  };
+  return true;
+}
+
+function shouldSuppressCanonicalPostDuringTransition(state, boardPayload) {
+  if (state?.currentBoardState?.phase !== BOARD_PHASES.TRANSITION) {
+    return false;
+  }
+
+  return !confirmBoardTransitionFromFeed(state, boardPayload);
+}
+
+function validateFeedEventsQueueBoards(boardPayloads) {
+  const boards = Array.isArray(boardPayloads) ? boardPayloads : [];
+  for (const boardPayload of boards) {
+    const missing = [];
+    if (!normalizeIdentityPart(boardPayload?.providerEventId)) missing.push('providerEventId');
+    if (!normalizeIdentityPart(boardPayload?.leagueId ?? boardPayload?.providerLeagueId)) missing.push('leagueId');
+    if (!normalizeIdentityPart(boardPayload?.weekNumber)) missing.push('weekNumber');
+    if (!normalizeIdentityPart(boardPayload?.firstMatch)) missing.push('firstMatch');
+    if (!Array.isArray(boardPayload?.events) || boardPayload.events.length === 0) missing.push('events');
+
+    if (missing.length > 0) {
+      return {
+        valid: false,
+        boardPayload,
+        missing,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    boardPayload: null,
+    missing: [],
+  };
+}
+
+function enrichQueueBoardPayloadsWithProviderLeagueRegistry(boardPayloads, now = Date.now()) {
+  if (!Array.isArray(boardPayloads)) {
+    return boardPayloads;
+  }
+
+  return boardPayloads.map((boardPayload) => {
+    const lookup = findRegisteredLeagueNumber(boardPayload, now, { logLookup: true });
+    const registryEntry = lookup.entry;
+    const registryLeagueNumber = normalizeIdentityPart(registryEntry?.leagueNumber);
+    if (!registryLeagueNumber || registryLeagueNumber === '21') {
+      return {
+        boardPayload,
+        registryHit: false,
+      };
+    }
+
+    return {
+      registryHit: true,
+      boardPayload: {
+        ...boardPayload,
+        leagueNumber: registryLeagueNumber,
+        events: (boardPayload.events ?? []).map((event) => ({
+          ...event,
+          leagueNumber: registryLeagueNumber,
+        })),
+      },
+    };
+  });
+}
+
+function buildFeedEventsQueuePayload(boardPayloads, capturedAt, now = Date.now()) {
+  const enrichedQueueBoards = enrichQueueBoardPayloadsWithProviderLeagueRegistry(boardPayloads, now);
+  const enrichedBoardPayloads = enrichedQueueBoards.map((entry) => entry.boardPayload);
+
   return {
     provider: 'VirtualHorizon',
     source: 'feed-events-queue',
-    leagueId: String(boardPayloads[0]?.leagueNumber || '21'),
+    leagueId: String(enrichedBoardPayloads[0]?.leagueId ?? enrichedBoardPayloads[0]?.providerLeagueId ?? '21'),
     capturedAt: new Date(capturedAt).toISOString(),
-    boards: boardPayloads.map((boardPayload, index) => {
-      const nextBoardPayload = boardPayloads[index + 1] ?? null;
+    boards: enrichedBoardPayloads.map((boardPayload, index) => {
+      const nextBoardPayload = enrichedBoardPayloads[index + 1] ?? null;
       const endAt = toQueueIsoTime(boardPayload.endTime);
 
-      return {
+      const queueBoard = {
+        provider: 'VirtualHorizon',
         providerEventId: boardPayload.providerEventId,
+        leagueId: String(boardPayload.leagueId ?? boardPayload.providerLeagueId ?? ''),
+        providerLeagueId: boardPayload.providerLeagueId,
+        leagueNumber: boardPayload.leagueNumber,
+        leagueName: boardPayload.leagueName,
         weekNumber: boardPayload.weekNumber,
+        boardKey: boardPayload.boardKey,
         firstMatch: boardPayload.firstMatch,
+        orderedMatchIds: boardPayload.orderedMatchIds,
         startAt: toQueueIsoTime(boardPayload.startTime),
         endAt,
         nextRefreshAt: endAt ?? toQueueIsoTime(nextBoardPayload?.startTime),
         matches: (boardPayload.events ?? []).map(mapFeedQueueMatch),
       };
+      Object.defineProperty(queueBoard, '__registryHit', {
+        value: enrichedQueueBoards[index]?.registryHit ?? false,
+        enumerable: false,
+      });
+      return queueBoard;
     }),
   };
 }
@@ -805,6 +1449,20 @@ function normalizeEventDetailToCanonical(feed, eventFeedId = '') {
   const event = getEventDetailObject(feed);
   const matches = getEventDetailMatchRows(event);
   const weekNumber = getEventDetailWeek(event);
+  const leagueId = String(
+    event?.f?.b?.a?.a?.d ??
+      event?.f?.b?.a?.d ??
+      event?.leagueId ??
+      event?.providerLeagueId ??
+      '',
+  );
+  const leagueNumber = getActualLeagueNumberFromRawEvent(event) || leagueId;
+  const orderedMatchIds = getOrderedMatchIdsFromRows(matches);
+  const boardKey = buildVirtualHorizonBoardKey({
+    leagueId,
+    providerEventId: eventFeedId,
+    orderedMatchIds,
+  });
 
   return matches
     .map((match) => match?.b ?? match)
@@ -816,6 +1474,10 @@ function normalizeEventDetailToCanonical(feed, eventFeedId = '') {
         ...canonicalEvent,
         providerEventId: String(eventFeedId || canonicalEvent.providerEventId),
         matchId: canonicalEvent.providerEventId,
+        boardKey,
+        leagueId,
+        leagueNumber,
+        orderedMatchIds,
         weekNumber: weekNumber || canonicalEvent.weekNumber,
       };
     });
@@ -1056,8 +1718,16 @@ function classifyEventDetailPacket(json, url) {
       event?.providerLeagueId ??
       '',
   );
+  const leagueNumber = getActualLeagueNumberFromRawEvent(event) || leagueId;
   const leagueName = event?.f?.b?.a?.a?.a ?? event?.f?.b?.a?.a ?? event?.leagueName ?? '';
+  const weekNumber = getEventDetailWeek(event);
   const matchRows = getRawEventDetailResultRowsFromPayload(json);
+  const orderedMatchIds = getOrderedMatchIdsFromRows(matchRows);
+  const boardKey = buildVirtualHorizonBoardKey({
+    leagueId,
+    providerEventId,
+    orderedMatchIds,
+  });
   const firstRawMatch = getFirstEventDetailPacketMatch(json);
   const results = matchRows.map((row, index) => {
     const matchRow = row;
@@ -1104,7 +1774,12 @@ function classifyEventDetailPacket(json, url) {
       source: 'event-detail-results',
       providerEventId,
       leagueId,
+      leagueNumber,
       leagueName,
+      weekNumber,
+      boardKey,
+      firstMatch: results[0]?.teams ?? '',
+      orderedMatchIds,
       eventType,
       capturedAt: new Date().toISOString(),
       matches: results,
@@ -1135,7 +1810,12 @@ function buildResultMonitorPayload(packet) {
     provider: 'VirtualHorizon',
     providerEventId: packet.providerEventId,
     leagueId: packet.resultsPayload.leagueId,
+    leagueNumber: packet.resultsPayload.leagueNumber,
     leagueName: packet.resultsPayload.leagueName,
+    weekNumber: packet.resultsPayload.weekNumber,
+    boardKey: packet.resultsPayload.boardKey,
+    firstMatch: packet.resultsPayload.firstMatch,
+    orderedMatchIds: packet.resultsPayload.orderedMatchIds,
     source: 'event-detail-results',
     receivedAt: new Date().toISOString(),
     matches: packet.resultsPayload.matches
@@ -1204,10 +1884,13 @@ function createResultLedgerEntry(providerEventId) {
   const now = Date.now();
   return {
     providerEventId,
+    boardKey: '',
     leagueId: '',
+    leagueNumber: '',
     leagueName: '',
     weekNumber: '',
     firstMatch: '',
+    orderedMatchIds: [],
     expectedMatchCount: null,
     eventSource: '',
     eventPostedAt: null,
@@ -1257,6 +1940,12 @@ function updateMissingLedgerMetadata(entry, metadata = {}) {
       }
       continue;
     }
+    if (Array.isArray(value)) {
+      if (!Array.isArray(entry[key]) || entry[key].length === 0) {
+        entry[key] = value;
+      }
+      continue;
+    }
     if (!entry[key]) entry[key] = value;
   }
   entry.lastUpdatedAt = Date.now();
@@ -1272,32 +1961,150 @@ function getBoardScheduledEndAt(boardPayload, cycleTiming = null) {
   return endAtMs ? new Date(endAtMs).toISOString() : null;
 }
 
+function getBoardProviderMatchIds(boardPayload) {
+  return getOrderedMatchIdsFromMappedMatches(boardPayload?.events);
+}
+
+function validateResultTrackableBoard(boardPayload, options = {}) {
+  const expectedMatchCount = options.expectedMatchCount ?? 10;
+  const missing = [];
+  if (!normalizeProviderEventId(boardPayload?.providerEventId || options.providerEventId)) missing.push('providerEventId');
+  if (!normalizeIdentityPart(boardPayload?.leagueId ?? boardPayload?.providerLeagueId)) missing.push('leagueId');
+  if (!normalizeIdentityPart(boardPayload?.weekNumber)) missing.push('weekNumber');
+  if (!normalizeIdentityPart(boardPayload?.firstMatch)) missing.push('firstMatch');
+
+  const providerMatchIds = getBoardProviderMatchIds(boardPayload);
+  if (providerMatchIds.length !== expectedMatchCount) missing.push(`matchCount:${providerMatchIds.length}`);
+  if (new Set(providerMatchIds).size !== providerMatchIds.length) missing.push('duplicateProviderMatchId');
+
+  if (options.requireConfirmedIdentity && options.visibleFirstMatch) {
+    const firstFeedEvent = boardPayload?.events?.[0] ?? {};
+    if (!canonicalMatchesVisible(firstFeedEvent, options.visibleFirstMatch)) {
+      missing.push('identityConfirmed');
+    }
+  }
+
+  return {
+    valid: missing.length === 0,
+    missing,
+    providerMatchIds,
+    expectedMatchCount,
+  };
+}
+
+function pruneRecentResultBoardHistory(now = Date.now()) {
+  for (const [providerEventId, snapshot] of recentResultBoardHistory.entries()) {
+    if (!snapshot?.trackedAt || now - snapshot.trackedAt > VH_RESULT_TRACK_TTL_MS) {
+      recentResultBoardHistory.delete(providerEventId);
+    }
+  }
+}
+
+function rememberRecentResultBoard(boardPayload, entry = null, now = Date.now()) {
+  const providerEventId = normalizeProviderEventId(boardPayload?.providerEventId || entry?.providerEventId);
+  if (!providerEventId) return null;
+  pruneRecentResultBoardHistory(now);
+  const snapshot = {
+    providerEventId,
+    boardKey: normalizeIdentityPart(boardPayload?.boardKey ?? entry?.boardKey),
+    leagueId: normalizeIdentityPart(boardPayload?.leagueId ?? boardPayload?.providerLeagueId ?? entry?.leagueId),
+    leagueNumber: normalizeIdentityPart(boardPayload?.leagueNumber ?? entry?.leagueNumber),
+    weekNumber: normalizeIdentityPart(boardPayload?.weekNumber ?? entry?.weekNumber),
+    firstMatch: normalizeIdentityPart(boardPayload?.firstMatch ?? entry?.firstMatch),
+    orderedMatchIds: boardPayload?.orderedMatchIds?.length ? boardPayload.orderedMatchIds : getBoardProviderMatchIds(boardPayload),
+    trackedAt: now,
+  };
+  recentResultBoardHistory.set(providerEventId, snapshot);
+  return snapshot;
+}
+
+function findRecentResultBoardForPacket(packet, monitorPayload, now = Date.now()) {
+  pruneRecentResultBoardHistory(now);
+  const providerEventId = normalizeProviderEventId(packet?.providerEventId ?? monitorPayload?.providerEventId);
+  if (providerEventId && recentResultBoardHistory.has(providerEventId)) {
+    return {
+      snapshot: recentResultBoardHistory.get(providerEventId),
+      matchedBy: 'providerEventId',
+    };
+  }
+
+  const boardKey = normalizeIdentityPart(packet?.resultsPayload?.boardKey ?? monitorPayload?.boardKey);
+  const orderedMatchIds = packet?.resultsPayload?.orderedMatchIds?.length
+    ? packet.resultsPayload.orderedMatchIds
+    : getOrderedMatchIdsFromMappedMatches(packet?.resultsPayload?.matches);
+
+  for (const snapshot of recentResultBoardHistory.values()) {
+    if (boardKey && snapshot.boardKey === boardKey) {
+      return { snapshot, matchedBy: 'boardKey' };
+    }
+
+    if (
+      orderedMatchIds.length === 10 &&
+      areOrderedMatchIdsEqual(snapshot.orderedMatchIds ?? [], orderedMatchIds)
+    ) {
+      return { snapshot, matchedBy: 'orderedMatchIds' };
+    }
+  }
+
+  return {
+    snapshot: null,
+    matchedBy: '',
+  };
+}
+
 function registerResultLedgerEventBoard(boardPayload, result = {}, source = FEED_EVENTS_SOURCE) {
-  const providerEventId = normalizeProviderEventId(boardPayload?.providerEventId ?? result.providerEventId);
+  const providerEventId = normalizeProviderEventId(boardPayload?.providerEventId) || normalizeProviderEventId(result.providerEventId);
   const entry = getResultLedgerEntry(providerEventId);
   if (!entry) return null;
+  const trackingValidation = validateResultTrackableBoard(boardPayload, {
+    expectedMatchCount: result.expectedMatchCount ?? 10,
+    providerEventId,
+    visibleFirstMatch: result.visibleFirstMatch,
+    requireConfirmedIdentity: Boolean(result.visibleFirstMatch),
+  });
+  if (!trackingValidation.valid) {
+    console.log(
+      `RESULT-LEDGER-NOT-TRACKED providerEventId=${providerEventId || 'not found'} ` +
+        `reason=${trackingValidation.missing.join(',')}`,
+    );
+    return null;
+  }
+  const orderedMatchIds = boardPayload?.orderedMatchIds?.length
+    ? boardPayload.orderedMatchIds
+    : trackingValidation.providerMatchIds;
+  const leagueId = String(boardPayload?.leagueId ?? boardPayload?.providerLeagueId ?? boardPayload?.leagueNumber ?? '');
+  const boardKey = boardPayload?.boardKey ?? buildVirtualHorizonBoardKey({
+    leagueId,
+    providerEventId,
+    orderedMatchIds,
+  });
 
-  const expectedMatchCount = Array.isArray(boardPayload?.events) && boardPayload.events.length > 0
-    ? boardPayload.events.length
-    : null;
+  const expectedMatchCount = trackingValidation.expectedMatchCount;
   updateMissingLedgerMetadata(entry, {
-    leagueId: String(boardPayload?.leagueNumber ?? boardPayload?.leagueId ?? ''),
+    boardKey,
+    leagueId,
+    leagueNumber: String(boardPayload?.leagueNumber ?? ''),
     leagueName: boardPayload?.leagueName ?? boardPayload?.events?.[0]?.leagueName ?? '',
     weekNumber: String(boardPayload?.weekNumber ?? ''),
     firstMatch: boardPayload?.firstMatch ?? '',
+    orderedMatchIds,
     expectedMatchCount,
     scheduledStartAt: getBoardScheduledStartAt(boardPayload),
     scheduledEndAt: getBoardScheduledEndAt(boardPayload, result.cycleTiming),
   });
 
   entry.eventSource = source;
-  entry.eventPostedAt = new Date().toISOString();
-  entry.eventPostSucceeded = true;
+  entry.eventPostedAt = result.result ? new Date().toISOString() : entry.eventPostedAt;
+  entry.eventPostSucceeded = result.result ? true : entry.eventPostSucceeded;
   entry.eventRegistrationObserved = true;
-  if (entry.status === 'EVENT_CAPTURED') entry.status = 'EVENT_POSTED';
+  if (entry.status === 'EVENT_CAPTURED') entry.status = result.result ? 'EVENT_POSTED' : 'EVENT_TRACKED';
   if (!entry.resultsReceivedAt && !entry.resultPostSucceededAt) entry.status = 'AWAITING_RESULTS';
   entry.lastUpdatedAt = Date.now();
+  rememberRecentResultBoard(boardPayload, entry);
 
+  console.log(
+    `RESULT-LEDGER-TRACKED providerEventId=${entry.providerEventId} matchCount=${expectedMatchCount}`,
+  );
   console.log(
     `RESULT-LEDGER-REGISTERED providerEventId=${entry.providerEventId} ` +
       `week=${entry.weekNumber || 'not found'} expected=${entry.expectedMatchCount ?? 'unknown'} ` +
@@ -1328,24 +2135,229 @@ function getResultPayloadExpectedMatchCount(packet, monitorPayload) {
   return payloadCount || 10;
 }
 
-function recordResultLedgerObservation(packet, monitorPayload) {
-  const providerEventId = normalizeProviderEventId(packet?.providerEventId ?? monitorPayload?.providerEventId);
-  const entry = getResultLedgerEntry(providerEventId);
-  if (!entry) return null;
+function validateCompleteResultPayload(packet) {
+  const matches = packet?.resultsPayload?.matches ?? [];
+  if (matches.length !== 10) {
+    return {
+      valid: false,
+      reason: `match-count-${matches.length}`,
+    };
+  }
 
-  const now = Date.now();
-  if (!entry.eventRegistrationObserved && !entry.firstResultSeenAt) {
+  const providerMatchIds = getOrderedMatchIdsFromMappedMatches(matches);
+  if (providerMatchIds.length !== 10) {
+    return {
+      valid: false,
+      reason: 'missing-providerMatchId',
+    };
+  }
+
+  if (new Set(providerMatchIds).size !== providerMatchIds.length) {
+    return {
+      valid: false,
+      reason: 'duplicate-providerMatchId',
+    };
+  }
+
+  if (!matches.every((match) => match.hasScore && isNumericScore(match.homeScore) && isNumericScore(match.awayScore))) {
+    return {
+      valid: false,
+      reason: 'partial-result-scores',
+    };
+  }
+
+  return {
+    valid: true,
+    reason: '',
+  };
+}
+
+function findKnownResultLedgerEntry(packet, monitorPayload) {
+  const providerEventId = normalizeProviderEventId(packet?.providerEventId ?? monitorPayload?.providerEventId);
+  const leagueId = normalizeIdentityPart(packet?.resultsPayload?.leagueId ?? monitorPayload?.leagueId);
+  const boardKey = normalizeIdentityPart(packet?.resultsPayload?.boardKey ?? monitorPayload?.boardKey);
+  const orderedMatchIds = packet?.resultsPayload?.orderedMatchIds?.length
+    ? packet.resultsPayload.orderedMatchIds
+    : getOrderedMatchIdsFromMappedMatches(packet?.resultsPayload?.matches);
+
+  if (providerEventId && resultCompletenessLedger.has(providerEventId)) {
+    return {
+      entry: resultCompletenessLedger.get(providerEventId),
+      matchedBy: 'providerEventId',
+    };
+  }
+
+  for (const entry of resultCompletenessLedger.values()) {
+    if (boardKey && entry.boardKey === boardKey) {
+      return { entry, matchedBy: 'boardKey' };
+    }
+
+    if (
+      leagueId &&
+      normalizeIdentityPart(entry.leagueId) === leagueId &&
+      orderedMatchIds.length === 10 &&
+      areOrderedMatchIdsEqual(entry.orderedMatchIds ?? [], orderedMatchIds)
+    ) {
+      return { entry, matchedBy: 'orderedMatchIds' };
+    }
+  }
+
+  return {
+    entry: null,
+    matchedBy: '',
+  };
+}
+
+function providerMatchIdsMatchTrackedBoard(packet, monitorPayload, entryOrSnapshot) {
+  const resultMatchIds = packet?.resultsPayload?.orderedMatchIds?.length
+    ? packet.resultsPayload.orderedMatchIds
+    : getOrderedMatchIdsFromMappedMatches(packet?.resultsPayload?.matches ?? monitorPayload?.matches);
+  const trackedMatchIds = entryOrSnapshot?.orderedMatchIds ?? [];
+  return Boolean(
+    resultMatchIds.length === 10 &&
+      trackedMatchIds.length === 10 &&
+      areOrderedMatchIdsEqual(trackedMatchIds, resultMatchIds)
+  );
+}
+
+function resultMatchesCompletedTarget(packet, monitorPayload, resultWatch = null) {
+  if (!resultWatch?.providerEventId && !resultWatch?.boardKey) {
+    return true;
+  }
+  if (resultWatch.until && Date.now() > resultWatch.until) {
+    return true;
+  }
+
+  const providerEventId = normalizeProviderEventId(packet?.providerEventId ?? monitorPayload?.providerEventId);
+  const boardKey = normalizeIdentityPart(packet?.resultsPayload?.boardKey ?? monitorPayload?.boardKey);
+  const orderedMatchIds = packet?.resultsPayload?.orderedMatchIds?.length
+    ? packet.resultsPayload.orderedMatchIds
+    : getOrderedMatchIdsFromMappedMatches(packet?.resultsPayload?.matches);
+  const targetMatchIds = resultWatch.activeBoardSnapshot?.orderedMatchIds ?? [];
+
+  return Boolean(
+    (providerEventId && providerEventId === normalizeProviderEventId(resultWatch.providerEventId)) ||
+      (boardKey && boardKey === normalizeIdentityPart(resultWatch.boardKey)) ||
+      (
+        targetMatchIds.length === 10 &&
+        orderedMatchIds.length === 10 &&
+        areOrderedMatchIdsEqual(targetMatchIds, orderedMatchIds)
+      ),
+  );
+}
+
+function isActualLeagueNumber(value, leagueId) {
+  const normalizedValue = normalizeIdentityPart(value);
+  return Boolean(normalizedValue && normalizedValue !== normalizeIdentityPart(leagueId));
+}
+
+function enrichResultPayloadLeagueNumber(packet, monitorPayload, entry, resultWatch = null) {
+  const leagueId = normalizeIdentityPart(packet?.resultsPayload?.leagueId ?? monitorPayload?.leagueId ?? entry?.leagueId);
+  const candidates = [
+    resultWatch?.activeBoardSnapshot?.leagueNumber,
+    entry?.leagueNumber,
+    packet?.resultsPayload?.leagueNumber,
+    monitorPayload?.leagueNumber,
+  ];
+  const leagueNumber = candidates.find((value) => isActualLeagueNumber(value, leagueId));
+
+  if (!leagueNumber) {
+    return '';
+  }
+
+  if (packet?.resultsPayload) {
+    packet.resultsPayload.leagueNumber = String(leagueNumber);
+  }
+  if (monitorPayload) {
+    monitorPayload.leagueNumber = String(leagueNumber);
+  }
+
+  return String(leagueNumber);
+}
+
+function recordResultLedgerObservation(packet, monitorPayload, options = {}) {
+  const validation = validateCompleteResultPayload(packet);
+  if (!validation.valid) {
     console.log(
-      `RESULT-LEDGER-PROVISIONAL providerEventId=${providerEventId} ` +
-        `expected=${getResultPayloadExpectedMatchCount(packet, monitorPayload)} reason=result-seen-before-event-registration`,
+      `RESULT-REJECTED providerEventId=${packet?.providerEventId || 'not found'} ` +
+        `boardKey=${packet?.resultsPayload?.boardKey || 'not found'} reason=${validation.reason}`,
+    );
+    return { entry: null, isComplete: false, rejected: true, reason: validation.reason };
+  }
+
+  const providerEventId = normalizeProviderEventId(packet?.providerEventId ?? monitorPayload?.providerEventId);
+  const providerEventIdTracked = Boolean(providerEventId && resultCompletenessLedger.has(providerEventId));
+  const hasResultWatchTarget = Boolean(options.resultWatch?.providerEventId || options.resultWatch?.boardKey);
+  if (
+    (!providerEventIdTracked || hasResultWatchTarget) &&
+    !resultMatchesCompletedTarget(packet, monitorPayload, options.resultWatch)
+  ) {
+    console.log(
+      `RESULT-QUARANTINED providerEventId=${packet?.providerEventId || 'not found'} ` +
+        `boardKey=${packet?.resultsPayload?.boardKey || 'not found'} reason=not-current-completed-target ` +
+        `targetProviderEventId=${options.resultWatch?.providerEventId || 'not found'}`,
+    );
+    return { entry: null, isComplete: false, rejected: true, reason: 'not-current-completed-target' };
+  }
+
+  const knownBoard = findKnownResultLedgerEntry(packet, monitorPayload);
+  let entry = knownBoard.entry;
+  if (!entry) {
+    const recentBoard = findRecentResultBoardForPacket(packet, monitorPayload);
+    if (recentBoard.snapshot) {
+      entry = getResultLedgerEntry(recentBoard.snapshot.providerEventId);
+      updateMissingLedgerMetadata(entry, recentBoard.snapshot);
+      entry.eventRegistrationObserved = true;
+      if (entry.status === 'EVENT_CAPTURED') entry.status = 'AWAITING_RESULTS';
+      knownBoard.entry = entry;
+      knownBoard.matchedBy = `recent-${recentBoard.matchedBy}`;
+    }
+  }
+  if (!entry) {
+    console.log(
+      `RESULT-QUARANTINED providerEventId=${packet?.providerEventId || 'not found'} ` +
+        `boardKey=${packet?.resultsPayload?.boardKey || 'not found'} reason=unmatched-board`,
+    );
+    return { entry: null, isComplete: false, rejected: true, reason: 'unmatched-board' };
+  }
+
+  if (!providerMatchIdsMatchTrackedBoard(packet, monitorPayload, entry)) {
+    console.log(
+      `RESULT-QUARANTINED providerEventId=${packet?.providerEventId || 'not found'} ` +
+        `boardKey=${packet?.resultsPayload?.boardKey || 'not found'} reason=providerMatchId-mismatch`,
+    );
+    return { entry: null, isComplete: false, rejected: true, reason: 'providerMatchId-mismatch' };
+  }
+
+  console.log(`RESULT-LEDGER-MATCHED providerEventId=${entry.providerEventId} matchedBy=${knownBoard.matchedBy}`);
+
+  const enrichedLeagueNumber = enrichResultPayloadLeagueNumber(packet, monitorPayload, entry, options.resultWatch);
+  if (enrichedLeagueNumber) {
+    console.log(
+      `RESULT-LEAGUE-NUMBER providerEventId=${packet?.providerEventId || 'not found'} ` +
+        `leagueId=${packet?.resultsPayload?.leagueId || monitorPayload?.leagueId || 'not found'} ` +
+        `leagueNumber=${enrichedLeagueNumber}`,
     );
   }
 
+  if (entry.status === 'RESULTS_COMPLETE') {
+    console.log(
+      `RESULT-DUPLICATE providerEventId=${entry.providerEventId || 'not found'} ` +
+        `boardKey=${entry.boardKey || 'not found'} matchedBy=${knownBoard.matchedBy}`,
+    );
+    return { entry, isComplete: false, duplicate: true, reason: 'duplicate-result' };
+  }
+
+  const now = Date.now();
   updateMissingLedgerMetadata(entry, {
+    boardKey: packet?.resultsPayload?.boardKey ?? monitorPayload?.boardKey,
     leagueId: packet?.resultsPayload?.leagueId ?? monitorPayload?.leagueId,
+    leagueNumber: packet?.resultsPayload?.leagueNumber ?? monitorPayload?.leagueNumber,
     leagueName: packet?.resultsPayload?.leagueName ?? monitorPayload?.leagueName,
+    weekNumber: packet?.resultsPayload?.weekNumber ?? monitorPayload?.weekNumber,
     expectedMatchCount: getResultPayloadExpectedMatchCount(packet, monitorPayload),
     firstMatch: packet?.resultsPayload?.matches?.[0]?.teams,
+    orderedMatchIds: packet?.resultsPayload?.orderedMatchIds ?? monitorPayload?.orderedMatchIds,
   });
 
   entry.firstResultSeenAt = entry.firstResultSeenAt ?? new Date(now).toISOString();
@@ -1376,18 +2388,22 @@ function recordResultLedgerObservation(packet, monitorPayload) {
 
   if (isComplete) {
     entry.resultsReceivedAt = entry.resultsReceivedAt ?? new Date(now).toISOString();
+    console.log(
+      `[BOARD-STATE] completed providerEventId=${entry.providerEventId || 'not found'} ` +
+        `firstMatch="${entry.firstMatch || 'not found'}"`,
+    );
   } else if (entry.receivedMatchCount > 0) {
     entry.status = 'PARTIAL_RESULTS';
   }
 
   entry.lastUpdatedAt = now;
   console.log(
-    `RESULT-LEDGER-UPDATE providerEventId=${providerEventId} received=${entry.receivedMatchCount} ` +
-      `expected=${expected} state=${packet?.eventType || 'unknown'}`,
+    `RESULT-LEDGER-UPDATE providerEventId=${entry.providerEventId} boardKey=${entry.boardKey || 'not found'} ` +
+      `matchedBy=${knownBoard.matchedBy} received=${entry.receivedMatchCount} expected=${expected} state=${packet?.eventType || 'unknown'}`,
   );
   if (!isComplete) {
     console.log(
-      `RESULT-PARTIAL providerEventId=${providerEventId} expected=${expected} ` +
+      `RESULT-PARTIAL providerEventId=${entry.providerEventId} expected=${expected} ` +
         `received=${entry.receivedMatchCount} missing=${Math.max(0, expected - entry.receivedMatchCount)}`,
     );
   }
@@ -1437,9 +2453,11 @@ async function postResultMonitorPayloadWithLedger(entry, monitorPayload, { retry
   if (retry) {
     console.log(`RESULT-POST-RETRY providerEventId=${entry.providerEventId} attempt=${entry.resultPostAttempts}`);
   }
+  console.log(`RESULT-POSTING providerEventId=${entry.providerEventId} resultCount=${monitorPayload.matches.length}`);
 
   try {
     const monitorResult = await postResultMonitorPayload(monitorPayload);
+    console.log(`RESULT-POSTED providerEventId=${entry.providerEventId}`);
     markResultPostSuccess(entry, monitorPayload);
     return monitorResult;
   } catch (error) {
@@ -1540,10 +2558,12 @@ async function checkResultCompletenessLedger() {
   );
 }
 
-async function processResultMonitorPacket(packet) {
+async function processResultMonitorPacket(packet, options = {}) {
   logResultScores(packet);
   const monitorPayload = buildResultMonitorPayload(packet);
-  const observation = recordResultLedgerObservation(packet, monitorPayload);
+  const observation = recordResultLedgerObservation(packet, monitorPayload, {
+    resultWatch: options.resultWatch,
+  });
   let monitorResult = null;
 
   if (!observation?.isComplete) {
@@ -2443,6 +3463,7 @@ function createFeedEventsCapture(page, options = {}) {
   const feedEventsByCompositeKey = new Map();
   let latestFeedEventsRaw = null;
   let latestMappedFeed = null;
+  let latestBoardPayloads = [];
   let feedEventsResponseId = 0;
 
   const getCycle = options.getCycle ?? (() => 0);
@@ -2457,10 +3478,12 @@ function createFeedEventsCapture(page, options = {}) {
   const getRolloverState = options.getRolloverState ?? (() => ({ stable: true, visibleFirstMatch: null }));
   const getPendingDomRefresh = options.getPendingDomRefresh ?? (() => ({ pending: false }));
   const clearPendingDomRefresh = options.clearPendingDomRefresh ?? (() => {});
+  const onActiveBoardMatched = options.onActiveBoardMatched ?? (() => {});
   const getLastRolloverPostFailed = options.getLastRolloverPostFailed ?? (() => false);
   const clearLastRolloverPostFailed = options.clearLastRolloverPostFailed ?? (() => {});
   const markStartupInitialPost = options.markStartupInitialPost ?? (() => {});
   const getFeedEventsPostingEnabled = options.getFeedEventsPostingEnabled ?? (() => true);
+  const scheduleProviderLeagueDiscovery = options.scheduleProviderLeagueDiscovery ?? (() => {});
   const storeFeedEventsBoardPayload = (capture, boardPayload) => {
     if (!boardPayload) {
       return;
@@ -2590,6 +3613,25 @@ function createFeedEventsCapture(page, options = {}) {
           `firstMatch=${boardPayload?.firstMatch ?? 'not found'} week=${boardPayload?.weekNumber ?? 'not found'}`,
       );
       logFeedEventsOddsQueue(feedEventsResponseId, boardPayloads);
+      const passiveVisibleFirstMatch = boardPayload && getVisibleFirstMatch
+        ? await getVisibleFirstMatch().catch(() => null)
+        : null;
+      const passiveDomFirst = passiveVisibleFirstMatch ? getVisibleText(passiveVisibleFirstMatch) : '';
+      const domMatchedBoardPayload = passiveDomFirst
+        ? boardPayloads.find((payload) => payload?.firstMatch === passiveDomFirst) ?? null
+        : null;
+      const feedEventsMatchesDom = Boolean(domMatchedBoardPayload);
+      const observedDomBoard = createObservedDomBoard(passiveVisibleFirstMatch);
+      if (observedDomBoard && options.boardState) {
+        checkBoardTransitionTimeout(options.boardState);
+        if (domMatchedBoardPayload) {
+          if (!confirmBoardTransitionFromFeed(options.boardState, domMatchedBoardPayload, Date.now())) {
+            promoteBoardStateToActive(options.boardState, domMatchedBoardPayload, Date.now(), 'feed-dom-matched');
+          }
+        } else if (options.boardState.confirmedFeedBoard) {
+          enterBoardTransition(options.boardState, observedDomBoard, boardPayloads, 'dom-ahead-of-feed');
+        }
+      }
       const capture = {
         url: response.url(),
         json,
@@ -2602,10 +3644,16 @@ function createFeedEventsCapture(page, options = {}) {
 
       latestFeedEventsRaw = json;
       latestMappedFeed = boardPayload;
+      latestBoardPayloads = boardPayloads;
       captures.push(capture);
       boardPayloads.forEach((payload) => {
         storeFeedEventsBoardPayload(capture, payload);
+        registerResultLedgerEventBoard(payload, {
+          source: 'feed-events-queue',
+          expectedMatchCount: 10,
+        }, 'feed-events-queue');
       });
+      scheduleProviderLeagueDiscovery(boardPayloads);
       console.log(
         `FEED-STORED providerEventId=${boardPayload?.providerEventId ?? 'not found'} firstMatch=${boardPayload?.firstMatch ?? 'not found'}`,
       );
@@ -2614,18 +3662,10 @@ function createFeedEventsCapture(page, options = {}) {
       if (!lastPostedState) {
         return;
       }
-
-      const passiveVisibleFirstMatch = boardPayload && getVisibleFirstMatch
-        ? await getVisibleFirstMatch().catch(() => null)
-        : null;
-      const passiveDomFirst = passiveVisibleFirstMatch ? getVisibleText(passiveVisibleFirstMatch) : '';
-      const domMatchedBoardPayload = passiveDomFirst
-        ? boardPayloads.find((payload) => payload?.firstMatch === passiveDomFirst) ?? null
-        : null;
-      const feedEventsMatchesDom = Boolean(domMatchedBoardPayload);
       const pendingDomRefresh = getPendingDomRefresh();
 
       if (domMatchedBoardPayload && passiveVisibleFirstMatch) {
+        onActiveBoardMatched(domMatchedBoardPayload, passiveVisibleFirstMatch);
         const wasInitialFeedPost = !lastPostedState.providerEventId;
         const wasRolloverRetryPost = getLastRolloverPostFailed();
         const result = await postFeedEventsBoard(getCycle(), domMatchedBoardPayload, lastPostedState, {
@@ -2689,6 +3729,7 @@ function createFeedEventsCapture(page, options = {}) {
 
         if (initialVisibleFirstMatch) {
           if (domFirst && feedFirst && domFirst === feedFirst) {
+            onActiveBoardMatched(boardPayload, initialVisibleFirstMatch);
             const result = await handleFeedEventsResponse(getCycle(), json, lastPostedState, {
               feedReceivedAt: capture.capturedAt,
               generation: capture.generation,
@@ -2746,6 +3787,7 @@ function createFeedEventsCapture(page, options = {}) {
           providerEventId &&
           providerEventId !== lastPostedState.providerEventId
         ) {
+          onActiveBoardMatched(lateBoardPayload, lateVisibleFirstMatch);
           const result = await handleFeedEventsResponse(getCycle(), json, lastPostedState, {
             feedReceivedAt: capture.capturedAt,
             generation: capture.generation,
@@ -2818,6 +3860,21 @@ function createFeedEventsCapture(page, options = {}) {
         : isRolloverWindow && rolloverState.stable && rolloverState.visibleFirstMatch
         ? rolloverState.visibleFirstMatch
         : getVisibleFirstMatch ? await getVisibleFirstMatch().catch(() => null) : undefined;
+      if (shouldSuppressCanonicalPostDuringTransition(options.boardState, boardPayload)) {
+        const result = {
+          posted: false,
+          source: FEED_EVENTS_SOURCE,
+          skipped: true,
+          reason: 'board-transition',
+          providerEventId: boardPayload?.providerEventId ?? '',
+          domFirst: passiveDomFirst,
+          feedFirst: boardPayload?.firstMatch ?? '',
+        };
+        logFeedEventsVirtualApiNotPosted(result);
+        recordProcessedResult(capture, result);
+        onProcessed(result);
+        return;
+      }
       const result = await handleFeedEventsResponse(getCycle(), json, lastPostedState, {
         feedReceivedAt: capture.capturedAt,
         generation: capture.generation,
@@ -2867,6 +3924,10 @@ function createFeedEventsCapture(page, options = {}) {
     async latestMapped() {
       await Promise.allSettled(pending);
       return latestMappedFeed;
+    },
+    async latestBoardPayloads() {
+      await Promise.allSettled(pending);
+      return latestBoardPayloads;
     },
     findByFirstMatch(firstMatch) {
       const matches = feedEventsByFirstMatch.get(firstMatch) ?? [];
@@ -2924,10 +3985,12 @@ function createFeedEventsCapture(page, options = {}) {
         captures.push(preservedCapture);
         latestFeedEventsRaw = preservedCapture.json;
         latestMappedFeed = preservedCapture.boardPayload ?? latestMappedFeed;
+        latestBoardPayloads = parseFeedEventsBoards(preservedCapture.json);
         return true;
       } else {
         latestFeedEventsRaw = null;
         latestMappedFeed = null;
+        latestBoardPayloads = [];
       }
 
       return false;
@@ -3072,7 +4135,9 @@ function createEventDetailCapture(page, options = {}) {
       if (eventDetailPacket.hasResults) {
         captures.push(capture);
         onCaptured(capture);
-        const { monitorPayload, monitorResult } = await processResultMonitorPacket(eventDetailPacket);
+        const { monitorPayload, monitorResult } = await processResultMonitorPacket(eventDetailPacket, {
+          resultWatch: getPreviousCycleResultWatch(),
+        });
         const result = {
           posted: false,
           source: 'event-detail-results',
@@ -4571,6 +5636,317 @@ async function triggerCurrentBoardFeedRefresh(cycle, page, visibleFirstMatch, re
   }, 15_000);
 }
 
+async function activateQueueBoardForDiscovery(page, boardPayload, options = {}) {
+  assertUsablePage(page);
+
+  const target = await page.evaluate(({ weekNumber, firstMatch }) => {
+    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const normalizeToken = (value) => normalizeText(value).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const targetWeek = String(weekNumber || '').trim();
+    const targetFirst = normalizeToken(firstMatch);
+    const isVisible = (element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.visibility !== 'hidden' &&
+        style.display !== 'none' &&
+        Number(style.opacity) !== 0 &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.bottom >= 0 &&
+        rect.top <= window.innerHeight
+      );
+    };
+    const clickableAncestor = (element) => {
+      let candidate = element;
+      while (candidate && candidate !== document.body) {
+        const tagName = candidate.tagName.toLowerCase();
+        const role = candidate.getAttribute('role') || '';
+        const className = String(candidate.className || '');
+        if (
+          tagName === 'button' ||
+          tagName === 'a' ||
+          role === 'tab' ||
+          role === 'button' ||
+          /(?:week|league|tab|active|selected|current)/i.test(className)
+        ) {
+          return candidate;
+        }
+        candidate = candidate.parentElement;
+      }
+      return element;
+    };
+    const elements = Array.from(document.querySelectorAll('body *'))
+      .filter(isVisible)
+      .map((element) => ({
+        element,
+        text: normalizeText(element.innerText || element.textContent),
+      }))
+      .filter((item) => item.text && item.text.length <= 240);
+    const weekPattern = targetWeek ? new RegExp(`(?:\\bWEEK\\s+${targetWeek}\\b|^${targetWeek}$)`, 'i') : null;
+    const candidates = elements
+      .filter((item) => {
+        const element = clickableAncestor(item.element);
+        const className = String(element.className || '');
+        const role = element.getAttribute('role') || '';
+        const text = normalizeText(element.innerText || element.textContent);
+        const textToken = normalizeToken(text);
+        const isWeekLike = role === 'tab' || /\bWEEK\b/i.test(text) || /(?:week|league|tab)/i.test(className);
+        const weekMatches = weekPattern ? weekPattern.test(text) : false;
+        const firstMatches = targetFirst ? textToken.includes(targetFirst) : false;
+        return isWeekLike && weekMatches && firstMatches;
+      })
+      .map((item) => clickableAncestor(item.element));
+    const targetElement = candidates[0] ?? null;
+    if (!targetElement) {
+      return null;
+    }
+
+    const rect = targetElement.getBoundingClientRect();
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      text: normalizeText(targetElement.innerText || targetElement.textContent).slice(0, 120),
+    };
+  }, {
+    weekNumber: boardPayload?.weekNumber ?? '',
+    firstMatch: boardPayload?.firstMatch ?? '',
+  });
+
+  if (!target) {
+    return {
+      activated: false,
+      reason: 'target-not-found',
+    };
+  }
+
+  const responsePromise = page.waitForResponse((candidate) => (
+    candidate.url().includes(FEED_URL_MARKER) &&
+    candidate.request().method() === 'GET' &&
+    candidate.status() === 200
+  ), { timeout: options.timeoutMs ?? VH_LEAGUE_DISCOVERY_BOARD_TIMEOUT_MS }).catch(() => null);
+
+  await page.mouse.click(target.x, target.y).catch(async () => {
+    await page.mouse.click(Math.max(1, target.x - 20), target.y);
+  });
+
+  await sleep(options.settleMs ?? VH_LEAGUE_DISCOVERY_SETTLE_MS);
+  const response = await responsePromise;
+
+  return {
+    activated: true,
+    responseReceived: Boolean(response),
+    target,
+  };
+}
+
+async function waitForMatchingActiveBoardSnapshot(boardPayload, options = {}) {
+  const timeoutMs = options.timeoutMs ?? VH_LEAGUE_DISCOVERY_BOARD_TIMEOUT_MS;
+  const pollMs = options.pollMs ?? 250;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (options.isPageHealthy && !(await options.isPageHealthy().catch(() => false))) {
+      return {
+        matched: false,
+        reason: 'page-unhealthy',
+      };
+    }
+
+    const activeSnapshot = await Promise.resolve(options.getActiveBoardSnapshot?.()).catch(() => null);
+    if (doesActiveSnapshotMatchQueueBoard(activeSnapshot, boardPayload)) {
+      return {
+        matched: true,
+        activeSnapshot,
+      };
+    }
+
+    await sleep(pollMs);
+  }
+
+  return {
+    matched: false,
+    reason: 'timeout',
+  };
+}
+
+async function restorePreviouslyActiveBoard(previousActiveBoard, options = {}) {
+  if (!previousActiveBoard) {
+    return {
+      restored: false,
+      reason: 'no-previous-board',
+    };
+  }
+
+  const activateBoard = options.activateBoard ?? (
+    options.page ? (board) => activateQueueBoardForDiscovery(options.page, board, options) : null
+  );
+  if (!activateBoard) {
+    return {
+      restored: false,
+      reason: 'no-activator',
+    };
+  }
+
+  const activation = await activateBoard(previousActiveBoard);
+  if (activation?.activated === false) {
+    return {
+      restored: false,
+      reason: activation.reason || 'activation-failed',
+    };
+  }
+
+  const waitResult = await waitForMatchingActiveBoardSnapshot(previousActiveBoard, options);
+  return {
+    restored: Boolean(waitResult.matched),
+    reason: waitResult.reason,
+    activeSnapshot: waitResult.activeSnapshot,
+  };
+}
+
+async function runProviderLeagueDiscoveryPass(options = {}) {
+  const now = options.now ?? Date.now();
+  const enabled = options.enabled ?? VH_LEAGUE_DISCOVERY_ENABLED;
+  const maxBoards = options.maxBoards ?? VH_LEAGUE_DISCOVERY_MAX_BOARDS_PER_PASS;
+  const boardPayloads = options.boardPayloads ?? [];
+  const canRun = canRunProviderLeagueDiscovery({
+    enabled,
+    discoveryInProgress: providerLeagueDiscoveryInProgress,
+    shutdownRequested: options.shutdownRequested,
+    authRecovering: options.authRecovering,
+    loginRequired: options.loginRequired,
+    reloginInProgress: options.reloginInProgress,
+    browserUnhealthy: options.browserUnhealthy,
+    pageUnhealthy: options.pageUnhealthy,
+    providerUnhealthy: options.providerUnhealthy,
+    apiUnhealthy: options.apiUnhealthy,
+    criticalNavigationActive: options.criticalNavigationActive,
+    now,
+    lastRunAt: lastProviderLeagueDiscoveryAt,
+    intervalMs: options.intervalMs ?? VH_LEAGUE_DISCOVERY_INTERVAL_MS,
+  });
+
+  if (!canRun) {
+    return {
+      skipped: true,
+      reason: providerLeagueDiscoveryInProgress ? 'in-progress' : 'not-ready',
+    };
+  }
+
+  const missingBoards = getRegistryMissingQueueBoards(boardPayloads, { now, maxBoards });
+  if (missingBoards.length === 0) {
+    lastProviderLeagueDiscoveryAt = now;
+    return {
+      skipped: true,
+      reason: 'none-missing',
+      missing: 0,
+      total: boardPayloads.length,
+    };
+  }
+
+  providerLeagueDiscoveryInProgress = true;
+  const startedAt = Date.now();
+  let attempted = 0;
+  let registered = 0;
+  let skipped = 0;
+  const previousActiveBoard = options.getCurrentActiveBoard?.() ?? options.previousActiveBoard ?? null;
+  const activateBoard = options.activateBoard ?? (
+    options.page ? (board) => activateQueueBoardForDiscovery(options.page, board, options) : null
+  );
+
+  console.log(`[LEAGUE-DISCOVERY] start missing=${missingBoards.length} total=${boardPayloads.length}`);
+
+  try {
+    if (!activateBoard) {
+      console.log('[LEAGUE-DISCOVERY] skipped providerEventId=not found reason=no-activator');
+      return {
+        skipped: true,
+        reason: 'no-activator',
+        missing: missingBoards.length,
+        total: boardPayloads.length,
+      };
+    }
+
+    for (const boardPayload of missingBoards) {
+      attempted += 1;
+      console.log(
+        `[LEAGUE-DISCOVERY] target providerEventId=${boardPayload.providerEventId || 'not found'} ` +
+          `week=${boardPayload.weekNumber || 'not found'} firstMatch="${boardPayload.firstMatch || 'not found'}"`,
+      );
+
+      if (options.isPageHealthy && !(await options.isPageHealthy().catch(() => false))) {
+        skipped += 1;
+        console.log(
+          `[LEAGUE-DISCOVERY] skipped providerEventId=${boardPayload.providerEventId || 'not found'} reason=page-unhealthy`,
+        );
+        break;
+      }
+
+      const activation = await activateBoard(boardPayload);
+      if (activation?.activated === false) {
+        skipped += 1;
+        console.log(
+          `[LEAGUE-DISCOVERY] skipped providerEventId=${boardPayload.providerEventId || 'not found'} ` +
+            `reason=${activation.reason || 'activation-failed'}`,
+        );
+        continue;
+      }
+      console.log(`[LEAGUE-DISCOVERY] activated providerEventId=${boardPayload.providerEventId || 'not found'}`);
+
+      const waitResult = await waitForMatchingActiveBoardSnapshot(boardPayload, options);
+      if (!waitResult.matched) {
+        skipped += 1;
+        console.log(`[LEAGUE-DISCOVERY] timeout providerEventId=${boardPayload.providerEventId || 'not found'}`);
+        continue;
+      }
+
+      const entry = registerProviderLeagueNumber(waitResult.activeSnapshot);
+      const verified = lookupProviderLeagueNumber(boardPayload);
+      if (entry && isValidProviderLeagueNumber(verified?.leagueNumber)) {
+        registered += 1;
+        console.log(
+          `[LEAGUE-DISCOVERY] registered providerEventId=${boardPayload.providerEventId || 'not found'} ` +
+            `leagueNumber=${verified.leagueNumber}`,
+        );
+      } else {
+        skipped += 1;
+        console.log(
+          `[LEAGUE-DISCOVERY] skipped providerEventId=${boardPayload.providerEventId || 'not found'} reason=registry-not-verified`,
+        );
+      }
+    }
+  } finally {
+    if (previousActiveBoard) {
+      const restoreResult = await restorePreviouslyActiveBoard(previousActiveBoard, {
+        ...options,
+        activateBoard,
+      }).catch((error) => ({
+        restored: false,
+        reason: error.message || String(error),
+      }));
+      console.log(
+        `[LEAGUE-DISCOVERY] restored providerEventId=${previousActiveBoard.providerEventId || 'not found'} ` +
+          `ok=${Boolean(restoreResult.restored)}`,
+      );
+    }
+
+    lastProviderLeagueDiscoveryAt = Date.now();
+    providerLeagueDiscoveryInProgress = false;
+    console.log(
+      `[LEAGUE-DISCOVERY] complete attempted=${attempted} registered=${registered} skipped=${skipped} ` +
+        `durationMs=${Date.now() - startedAt}`,
+    );
+  }
+
+  return {
+    attempted,
+    registered,
+    skipped,
+    missing: missingBoards.length,
+    total: boardPayloads.length,
+  };
+}
+
 async function requestEventDetailByProviderEventId(cycle, page, providerEventId, reason) {
   assertUsablePage(page);
 
@@ -5178,6 +6554,12 @@ async function postFeedEventsBoard(cycle, boardPayload, lastPostedState, meta = 
   const detailCounts = LOG_ODDS_DETAILS
     ? ` eventCount=${counts.eventCount} marketCount=${counts.marketCount} selectionCount=${counts.selectionCount}`
     : '';
+  registerResultLedgerEventBoard(boardPayload, {
+    ...feedResultMeta,
+    cycleTiming,
+    visibleFirstMatch,
+    expectedMatchCount: 10,
+  }, FEED_EVENTS_SOURCE);
   console.log(
     `POSTING source=${FEED_EVENTS_SOURCE} league=${boardPayload.leagueNumber ?? 'not found'} week=${boardPayload.weekNumber ?? 'not found'} ` +
       `providerEventId=${boardPayload.providerEventId} firstMatch=${boardPayload.firstMatch}${detailCounts} ` +
@@ -5215,7 +6597,7 @@ async function postFeedEventsBoard(cycle, boardPayload, lastPostedState, meta = 
     `VIRTUAL-API-POSTED source=${FEED_EVENTS_SOURCE} providerEventId=${boardPayload.providerEventId || 'not found'} ` +
       `week=${boardPayload.weekNumber || 'not found'} firstMatch=${boardPayload.firstMatch || 'not found'}`,
   );
-  registerResultLedgerEventBoard(boardPayload, { ...feedResultMeta, cycleTiming }, FEED_EVENTS_SOURCE);
+  registerResultLedgerEventBoard(boardPayload, { ...feedResultMeta, cycleTiming, result }, FEED_EVENTS_SOURCE);
 
   return {
     posted: true,
@@ -6279,13 +7661,33 @@ async function postResultMonitorPayload(resultsPayload) {
   return payload ?? {};
 }
 
+function logFeedEventsQueueOutbound(queuePayload) {
+  (queuePayload.boards ?? []).forEach((board) => {
+    console.log(
+      `[SCRAPER->QUEUE] providerEventId=${board.providerEventId || 'not found'} ` +
+        `leagueNumber=${board.leagueNumber || 'not found'} registryHit=${Boolean(board.__registryHit)}`,
+    );
+  });
+}
+
 function postFeedEventsQueueInBackground(cycle, boardPayloads, capturedAt) {
   if (!boardPayloads.length) {
     console.log(`cycle=${cycle} source=feed-events-queue skipped reason=no-boards`);
     return;
   }
 
+  const queueValidation = validateFeedEventsQueueBoards(boardPayloads);
+  if (!queueValidation.valid) {
+    console.log(
+      `QUEUE-IMPORT-SKIPPED reason=incomplete-board ` +
+        `providerEventId=${queueValidation.boardPayload?.providerEventId || 'not found'} ` +
+        `missing=${queueValidation.missing.join(',')}`,
+    );
+    return;
+  }
+
   const queuePayload = buildFeedEventsQueuePayload(boardPayloads, capturedAt);
+  logFeedEventsQueueOutbound(queuePayload);
 
   postFeedEventsQueue(queuePayload)
     .then((result) => {
@@ -6422,8 +7824,12 @@ async function runBrowserSession() {
   let startupResyncDisabled = false;
   let previousCycleResultWatch = {
     providerEventId: '',
+    boardKey: '',
     until: 0,
+    activeBoardSnapshot: null,
   };
+  let activeBoardSnapshot = null;
+  let boardState = createInitialBoardState();
   const lastPostedHashes = new Map();
   const eventDetailCache = new Map();
   const lastPostedFeedState = {
@@ -6686,10 +8092,49 @@ async function runBrowserSession() {
     startupResyncDisabled = false;
     previousCycleResultWatch = {
       providerEventId: '',
+      boardKey: '',
       until: 0,
+      activeBoardSnapshot: null,
+    };
+    activeBoardSnapshot = null;
+    boardState = createInitialBoardState();
+    const getLeagueDiscoveryState = () => ({
+      shutdownRequested,
+      authRecovering: Boolean(pendingAuthenticationFailureReason),
+      loginRequired: false,
+      reloginInProgress: false,
+      browserUnhealthy: !browser?.isConnected?.() || page?.isClosed?.(),
+      pageUnhealthy: page?.isClosed?.(),
+      providerUnhealthy: Boolean(offlineDetected),
+      apiUnhealthy: false,
+      criticalNavigationActive: Boolean(pendingDomRefresh),
+    });
+    const scheduleProviderLeagueDiscovery = (boardPayloads) => {
+      if (!VH_LEAGUE_DISCOVERY_ENABLED || !Array.isArray(boardPayloads) || boardPayloads.length === 0) {
+        return;
+      }
+
+      setTimeout(() => {
+        runProviderLeagueDiscoveryPass({
+          ...getLeagueDiscoveryState(),
+          boardPayloads,
+          page,
+          getActiveBoardSnapshot: () => activeBoardSnapshot,
+          getCurrentActiveBoard: () => activeBoardSnapshot,
+          isPageHealthy: async () => (
+            !shutdownRequested &&
+            !pendingAuthenticationFailureReason &&
+            browser?.isConnected?.() &&
+            !page?.isClosed?.()
+          ),
+        }).catch((error) => {
+          console.log(`[LEAGUE-DISCOVERY] skipped providerEventId=not found reason=${safeError(error)}`);
+        });
+      }, 0);
     };
     feedEventsCapture = createFeedEventsCapture(page, {
       getCycle: () => cycle,
+      boardState,
       lastPostedState: lastPostedFeedState,
       getPreviousCycleTiming: () => lastFeedCycleTiming,
       getVisibleFirstMatch: () => readVisibleFirstMatch(page),
@@ -6715,6 +8160,26 @@ async function runBrowserSession() {
         pendingDomVisibleFirstMatch = null;
         pendingDomRefreshReason = '';
       },
+      onActiveBoardMatched: (boardPayload, visibleFirstMatch) => {
+        if (!shouldUpdateActiveBoardSnapshot(boardPayload, visibleFirstMatch)) {
+          return;
+        }
+
+        activeBoardSnapshot = createActiveBoardSnapshot(boardPayload, visibleFirstMatch);
+        registerProviderLeagueNumber({
+          providerEventId: activeBoardSnapshot.providerEventId,
+          boardKey: activeBoardSnapshot.boardKey,
+          leagueNumber: activeBoardSnapshot.leagueNumber,
+          weekNumber: activeBoardSnapshot.weekNumber,
+          firstMatch: activeBoardSnapshot.firstMatch,
+        });
+        console.log(
+          `ACTIVE-BOARD-SNAPSHOT providerEventId=${activeBoardSnapshot.providerEventId || 'not found'} ` +
+            `boardKey=${activeBoardSnapshot.boardKey || 'not found'} leagueId=${activeBoardSnapshot.leagueId || 'not found'} ` +
+            `leagueNumber=${activeBoardSnapshot.leagueNumber || 'not found'} week=${activeBoardSnapshot.weekNumber || 'not found'} ` +
+            `firstMatch=${activeBoardSnapshot.firstMatch || 'not found'}`,
+        );
+      },
       getLastRolloverPostFailed: () => lastRolloverPostFailed,
       clearLastRolloverPostFailed: () => {
         lastRolloverPostFailed = false;
@@ -6723,6 +8188,7 @@ async function runBrowserSession() {
         startupResyncInitialFirstMatch = firstMatch;
         startupResyncLastPostedFirstMatch = firstMatch;
       },
+      scheduleProviderLeagueDiscovery,
       onFeedEvents200: (capture) => {
         if (capture.generation !== lastPostedFeedState.generation) {
           return;
@@ -7419,6 +8885,13 @@ async function runBrowserSession() {
               refreshTriggered: false,
             };
             console.log(`cycle=${cycle} dom-transition old=${previousVisibleText} new=${currentVisibleText}`);
+            const latestQueueBoards = await feedEventsCapture?.latestBoardPayloads?.().catch(() => []);
+            enterBoardTransition(
+              boardState,
+              createObservedDomBoard(currentVisibleFirstMatch),
+              latestQueueBoards,
+              'dom-ahead-of-feed',
+            );
             const matchedFeedEventsItem = feedEventsCapture?.findByFirstMatch(currentVisibleText);
             if (matchedFeedEventsItem) {
               console.log(
@@ -7543,20 +9016,21 @@ async function runBrowserSession() {
 
         if (currentVisibleCountdown?.found && currentVisibleCountdown.totalSeconds <= 0) {
           const oldFirstMatch = currentVisibleFirstMatch ? getVisibleText(currentVisibleFirstMatch) : '';
-          const previousProviderEventId = String(
-            lastPostedFeedState.providerEventId ||
-              lastPostedFeedState.latestSeenProviderEventId ||
-              feedClockSnapshot?.providerEventId ||
-              '',
-          );
-          if (previousProviderEventId) {
-            previousCycleResultWatch = {
-              providerEventId: previousProviderEventId,
-              until: Date.now() + PREVIOUS_CYCLE_RESULT_WATCH_MS,
-            };
+          const resultWatch = createPreviousCycleResultWatchFromSnapshot(activeBoardSnapshot);
+          if (resultWatch.providerEventId) {
+            previousCycleResultWatch = resultWatch;
             console.log(
-              `PREVIOUS-CYCLE-RESULT-WATCH providerEventId=${previousProviderEventId} ` +
+              `[BOARD-STATE] previous-results providerEventId=${resultWatch.providerEventId} ` +
+                `firstMatch="${resultWatch.activeBoardSnapshot?.firstMatch || 'not found'}"`,
+            );
+            console.log(
+              `PREVIOUS-CYCLE-RESULT-WATCH providerEventId=${resultWatch.providerEventId} ` +
+                `boardKey=${resultWatch.boardKey || 'not found'} firstMatch=${resultWatch.activeBoardSnapshot?.firstMatch || 'not found'} ` +
                 `durationMs=${PREVIOUS_CYCLE_RESULT_WATCH_MS}`,
+            );
+          } else {
+            console.log(
+              `PREVIOUS-CYCLE-RESULT-WATCH skipped reason=no-active-board-snapshot oldFirst=${oldFirstMatch || 'not found'}`,
             );
           }
           console.log(`cycle=${cycle} CYCLE-ROLLOVER oldFirst=${oldFirstMatch || 'not found'}`);
@@ -7747,6 +9221,49 @@ if (require.main === module) {
 }
 
 module.exports = {
+  __test: {
+    areOrderedMatchIdsEqual,
+    buildFeedEventsQueuePayload,
+    buildResultMonitorPayload,
+    buildVirtualHorizonBoardKey,
+    BOARD_PHASES,
+    boardFeedMatchesObservedDom,
+    checkBoardTransitionTimeout,
+    classifyEventDetailPacket,
+    confirmBoardTransitionFromFeed,
+    createActiveBoardSnapshot,
+    createConfirmedFeedBoard,
+    createInitialBoardState,
+    createObservedDomBoard,
+    createPreviousCycleResultWatchFromSnapshot,
+    canRunProviderLeagueDiscovery,
+    doesActiveSnapshotMatchQueueBoard,
+    enrichQueueBoardPayloadsWithProviderLeagueRegistry,
+    enrichResultPayloadLeagueNumber,
+    findRegisteredLeagueNumber,
+    findTransitionTargetFromQueue,
+    getRegistryMissingQueueBoards,
+    lookupProviderLeagueNumber,
+    parseFeedEventsBoardFromBoard,
+    providerLeagueNumberRegistry,
+    pruneProviderLeagueNumberRegistry,
+    recordResultLedgerObservation,
+    postResultMonitorPayloadWithLedger,
+    recentResultBoardHistory,
+    registerProviderLeagueNumber,
+    registerResultLedgerEventBoard,
+    restorePreviouslyActiveBoard,
+    runProviderLeagueDiscoveryPass,
+    shouldSuppressCanonicalPostDuringTransition,
+    resultMatchesCompletedTarget,
+    resultCompletenessLedger,
+    shouldUpdateActiveBoardSnapshot,
+    enterBoardTransition,
+    promoteBoardStateToActive,
+    validateFeedEventsQueueBoards,
+    validateResultTrackableBoard,
+    validateCompleteResultPayload,
+  },
   classifyBrowserErrorPage,
   createBrowserErrorConfirmationState,
   detectBrowserErrorPage,
