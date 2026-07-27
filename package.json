@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "",
   "scripts": {
+    "test": "node --test",
     "login": "node login.js",
     "inspect": "node inspect-network.js",
     "inspect:timer": "node inspect-timer-style.js",
