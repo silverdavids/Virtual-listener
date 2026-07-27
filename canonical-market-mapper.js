@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { getCanonicalMarketCode } = require('./providers/virtualhorizon/market-map');
+const { normalizeProviderTimestamp } = require('./provider-timestamp');
 
 const INPUT_FILE = path.join('data', 'normalized-events.json');
 const OUTPUT_FILE = path.join('data', 'canonical-events.json');
@@ -24,12 +25,7 @@ function normalizeSelectionName(name) {
 }
 
 function toIsoTime(timestamp) {
-  if (!timestamp) {
-    return null;
-  }
-
-  const date = new Date(timestamp);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  return normalizeProviderTimestamp(timestamp);
 }
 
 function mapMarket(market) {
@@ -43,16 +39,37 @@ function mapMarket(market) {
   };
 }
 
-function mapEvent(event) {
+function mapEvent(event, context = {}) {
+  const providerMatchId = String(event.eventId ?? event.providerMatchId ?? '');
+  const providerEventId = context.providerEventId || event.providerEventId;
+  const startTime = normalizeProviderTimestamp(event.startTime, {
+    providerEventId,
+    providerMatchId,
+  });
+
+  if (!startTime) {
+    console.error('[virtual-horizon] invalid event startTime', {
+      providerEventId,
+      providerMatchId,
+      homeTeam: event.homeTeam,
+      awayTeam: event.awayTeam,
+      rawStartTime: event.startTime,
+      rawStartTimeType: event.startTime instanceof Date ? 'Date' : typeof event.startTime,
+      sourceField: event.startTimeSourceField,
+      availableCandidateTimestampFields: event.availableCandidateTimestampFields,
+    });
+  }
+
   return {
     provider: PROVIDER,
     providerEventId: String(event.eventId),
+    providerMatchId,
     sport: SPORT,
     leagueId: event.leagueId,
     leagueName: event.leagueName,
     homeTeam: event.homeTeam,
     awayTeam: event.awayTeam,
-    startTime: toIsoTime(event.startTime),
+    startTime,
     markets: (event.markets ?? []).map(mapMarket),
   };
 }

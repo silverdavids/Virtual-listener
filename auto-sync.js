@@ -6,6 +6,11 @@ const readline = require('node:readline/promises');
 const { stdin: input, stdout: output } = require('node:process');
 const { getFixtures, normalizeEvent, values } = require('./analyze-feed');
 const { mapEvent, toIsoTime } = require('./canonical-market-mapper');
+const { normalizeProviderTimestamp } = require('./provider-timestamp');
+const {
+  validateCanonicalBoard,
+  logBlockedCanonicalBoard,
+} = require('./canonical-board-guard');
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -566,13 +571,7 @@ function mapFeedMarket(market) {
 }
 
 function toFeedIsoTime(timestamp) {
-  const numericTimestamp = Number(timestamp);
-  if (!Number.isFinite(numericTimestamp)) {
-    return null;
-  }
-
-  const date = new Date(numericTimestamp);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  return normalizeProviderTimestamp(timestamp);
 }
 
 function toEpochMs(value) {
@@ -607,13 +606,39 @@ function mapFeedMatch(row, boardMeta) {
     .filter((market) => market && typeof market === 'object')
     .map(mapFeedMarket)
     .filter((market) => market.name || market.selections.length > 0);
+  const providerMatchId = String(match?.a ?? '');
+  const hasMatchStartTime = match?.f !== null && match?.f !== undefined && match?.f !== '';
+  const rawStartTime = hasMatchStartTime ? match.f : boardMeta.startTime;
+  const sourceField = hasMatchStartTime ? 'match.f' : 'board.d';
+  const startTime = normalizeProviderTimestamp(rawStartTime, {
+    providerEventId: boardMeta.providerEventId,
+    providerMatchId,
+  });
+
+  if (!startTime) {
+    console.error('[virtual-horizon] invalid event startTime', {
+      providerEventId: String(boardMeta.providerEventId ?? ''),
+      providerMatchId,
+      homeTeam,
+      awayTeam,
+      rawStartTime,
+      rawStartTimeType: rawStartTime instanceof Date ? 'Date' : typeof rawStartTime,
+      sourceField,
+      availableCandidateTimestampFields: {
+        'match.f': match?.f,
+        'match.startTime': match?.startTime,
+        'board.d': boardMeta.startTime,
+      },
+    });
+  }
 
   return {
     provider: 'VirtualHorizon',
     providerEventId: String(boardMeta.providerEventId ?? ''),
     eventId: String(boardMeta.providerEventId ?? ''),
     boardKey: boardMeta.boardKey,
-    matchId: String(match?.a ?? ''),
+    matchId: providerMatchId,
+    providerMatchId,
     sport: 'FOOTBALL',
     leagueId: String(boardMeta.providerLeagueId ?? boardMeta.leagueNumber ?? ''),
     leagueNumber: String(boardMeta.leagueNumber ?? ''),
@@ -622,7 +647,7 @@ function mapFeedMatch(row, boardMeta) {
     weekNumber: boardMeta.weekNumber,
     homeTeam,
     awayTeam,
-    startTime: toFeedIsoTime(match?.f || boardMeta.startTime),
+    startTime,
     status: match?.c ?? null,
     markets,
   };
@@ -655,6 +680,7 @@ function parseFeedEventsBoardFromBoard(board) {
     endTime: board?.e ?? board?.endTime ?? board?.finishTime ?? null,
     countdownSeconds: toCycleSeconds(board?.countdown ?? board?.countdownSeconds ?? board?.remainingSeconds ?? board?.remainingTime),
     firstMatch: `${firstTeams?.a?.a ?? ''} vs ${firstTeams?.b?.a ?? ''}`,
+    expectedMatchCount: 10,
     orderedMatchIds,
     boardKey: buildVirtualHorizonBoardKey({
       leagueId: normalizedLeagueId,
@@ -757,8 +783,7 @@ function logFeedEventsOddsQueue(responseId, boardPayloads) {
 }
 
 function toQueueIsoTime(value) {
-  const epochMs = toEpochMs(value);
-  return epochMs === null ? null : new Date(epochMs).toISOString();
+  return normalizeProviderTimestamp(value);
 }
 
 function mapFeedQueueMatch(event) {
@@ -767,6 +792,7 @@ function mapFeedQueueMatch(event) {
     eventId: event.eventId,
     boardKey: event.boardKey,
     matchId: event.matchId,
+    providerMatchId: event.providerMatchId || event.matchId,
     sport: event.sport,
     leagueId: event.leagueId,
     leagueNumber: event.leagueNumber,
@@ -1306,6 +1332,7 @@ function buildFeedEventsQueuePayload(boardPayloads, capturedAt, now = Date.now()
         startAt: toQueueIsoTime(boardPayload.startTime),
         endAt,
         nextRefreshAt: endAt ?? toQueueIsoTime(nextBoardPayload?.startTime),
+        expectedMatchCount: boardPayload.expectedMatchCount ?? 10,
         matches: (boardPayload.events ?? []).map(mapFeedQueueMatch),
       };
       Object.defineProperty(queueBoard, '__registryHit', {
@@ -1469,10 +1496,13 @@ function normalizeEventDetailToCanonical(feed, eventFeedId = '') {
     .filter((match) => match && typeof match === 'object')
     .map((match) => normalizeEvent(event, match))
     .map((normalizedEvent) => {
-      const canonicalEvent = mapEvent(normalizedEvent);
+      const canonicalEvent = mapEvent(normalizedEvent, {
+        providerEventId: String(eventFeedId || ''),
+      });
       return {
         ...canonicalEvent,
         providerEventId: String(eventFeedId || canonicalEvent.providerEventId),
+        providerMatchId: canonicalEvent.providerMatchId || canonicalEvent.providerEventId,
         matchId: canonicalEvent.providerEventId,
         boardKey,
         leagueId,
@@ -6429,6 +6459,23 @@ async function postFeedEventsBoard(cycle, boardPayload, lastPostedState, meta = 
     };
   }
 
+  const canonicalValidation = validateCanonicalBoard({
+    providerEventId: boardPayload.providerEventId,
+    expectedMatchCount: boardPayload.expectedMatchCount ?? 10,
+    events: boardPayload.events,
+  });
+  if (!canonicalValidation.valid) {
+    logBlockedCanonicalBoard(canonicalValidation);
+    return {
+      posted: false,
+      source: FEED_EVENTS_SOURCE,
+      reason: 'invalid-canonical-board',
+      invalid: true,
+      validation: canonicalValidation,
+      ...feedResultMeta,
+    };
+  }
+
   if (generation !== lastPostedState.generation) {
     console.log(
       `cycle=${cycle} source=${FEED_EVENTS_SOURCE} providerEventId=${boardPayload.providerEventId} skipped reason=stale-feed-generation`,
@@ -6665,6 +6712,21 @@ async function postCanonicalEventsForSource(cycle, source, canonicalEvents, last
 
   const visibleFirstMatch = extra.visibleFirstMatch ?? null;
   const eventsToPost = applyVisibleMetadataToCanonicalEvents(canonicalEvents, visibleFirstMatch);
+  const canonicalValidation = validateCanonicalBoard({
+    providerEventId: extra.eventFeedId ?? eventsToPost[0]?.providerEventId,
+    expectedMatchCount: extra.expectedMatchCount ?? 10,
+    events: eventsToPost,
+  });
+  if (!canonicalValidation.valid) {
+    logBlockedCanonicalBoard(canonicalValidation);
+    return {
+      posted: false,
+      source,
+      reason: 'invalid-canonical-board',
+      invalid: true,
+      validation: canonicalValidation,
+    };
+  }
   const first = getFirstText(eventsToPost);
   const visible = getVisibleText(visibleFirstMatch);
 
@@ -7687,6 +7749,22 @@ function postFeedEventsQueueInBackground(cycle, boardPayloads, capturedAt) {
   }
 
   const queuePayload = buildFeedEventsQueuePayload(boardPayloads, capturedAt);
+  const invalidBoards = queuePayload.boards
+    .map((board) => validateCanonicalBoard({
+      providerEventId: board.providerEventId,
+      expectedMatchCount: board.expectedMatchCount,
+      events: board.matches,
+    }))
+    .filter((validation) => !validation.valid);
+
+  if (invalidBoards.length > 0) {
+    invalidBoards.forEach(logBlockedCanonicalBoard);
+    console.log(
+      `QUEUE-IMPORT-NOT-POSTED source=feed-events-queue reason=invalid-canonical-board ` +
+        `boardCount=${queuePayload.boards.length} capturedAt=${queuePayload.capturedAt}`,
+    );
+    return;
+  }
   logFeedEventsQueueOutbound(queuePayload);
 
   postFeedEventsQueue(queuePayload)
