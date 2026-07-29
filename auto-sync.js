@@ -48,6 +48,7 @@ const VH_PASSWORD = process.env.VH_PASSWORD;
 const FORCE_MANUAL_LOGIN = parseEnvBoolean(process.env.FORCE_MANUAL_LOGIN, false);
 const TEST_BLOCK_FEED_EVENTS = parseEnvBoolean(process.env.TEST_BLOCK_FEED_EVENTS, false);
 const LOG_ODDS_DETAILS = process.env.LOG_ODDS_DETAILS === 'true';
+const VH_DEBUG_MARKET_PAYLOADS = process.env.VH_DEBUG_MARKET_PAYLOADS === 'true';
 const LOG_RESULT_RAW_DUMP = process.env.LOG_RESULT_RAW_DUMP === 'true';
 const LOG_RESULT_SUMMARY = process.env.LOG_RESULT_SUMMARY !== 'false';
 const TRACE_NETWORK = parseEnvBoolean(process.env.TRACE_NETWORK, false);
@@ -360,6 +361,242 @@ function hashCanonicalEvents(canonicalEvents) {
     .createHash('sha256')
     .update(JSON.stringify(canonicalEvents))
     .digest('hex');
+}
+
+function getDiagnosticMarketEntries(markets) {
+  if (Array.isArray(markets)) {
+    return markets.map((market) => [
+      market?.code ?? market?.name ?? '',
+      market?.selections ?? [],
+    ]);
+  }
+
+  return Object.entries(markets || {});
+}
+
+function getDiagnosticSelectionKeys(selections) {
+  if (Array.isArray(selections)) {
+    return selections.map((selection) => selection?.name).filter(Boolean);
+  }
+
+  return selections && typeof selections === 'object'
+    ? Object.keys(selections)
+    : [];
+}
+
+function summarizeBoardMarkets(board) {
+  const events = Array.isArray(board?.events) ? board.events : [];
+
+  return {
+    providerEventId: board?.providerEventId,
+    boardKey: board?.boardKey,
+    leagueId: board?.leagueId,
+    leagueNumber: board?.leagueNumber,
+    weekNumber: board?.weekNumber,
+    firstMatch: board?.firstMatch,
+    eventCount: events.length,
+    events: events.map((event, index) => ({
+      index,
+      eventId: event?.eventId,
+      providerMatchId: event?.providerMatchId,
+      fixture: `${event?.homeTeam || '?'} vs ${event?.awayTeam || '?'}`,
+      marketKeys: getDiagnosticMarketEntries(event?.markets).map(([marketKey]) => marketKey),
+      selectionsByMarket: Object.fromEntries(
+        getDiagnosticMarketEntries(event?.markets).map(([marketKey, selections]) => [
+          marketKey,
+          getDiagnosticSelectionKeys(selections),
+        ])
+      ),
+    })),
+  };
+}
+
+const EXPECTED_MARKET_ALIASES = {
+  homeOverUnder: ['homeoverunder', 'homeovun', 'homeou', 'hou'],
+  awayOverUnder: ['awayoverunder', 'awayovun', 'awayou', 'aou'],
+  resultOverUnder15: [
+    'resultoverunder15',
+    'resultovun15',
+    '1x2overunder15',
+    '1x2ovun15',
+    '1x2ou15',
+    'rou15',
+  ],
+  resultOverUnder25: [
+    'resultoverunder25',
+    'resultovun25',
+    '1x2overunder25',
+    '1x2ovun25',
+    '1x2ou25',
+    'rou25',
+  ],
+};
+
+function normalizeDiagnosticMarketKey(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function buildMarketPayloadSummary(board) {
+  const summary = summarizeBoardMarkets(board);
+  const marketKeys = [...new Set(summary.events.flatMap((event) => event.marketKeys))];
+  const selectionCounts = Object.fromEntries(marketKeys.map((marketKey) => [
+    marketKey,
+    summary.events.reduce(
+      (count, event) => count + (event.selectionsByMarket[marketKey]?.length ?? 0),
+      0,
+    ),
+  ]));
+  const expectedMarketPresence = Object.fromEntries(
+    Object.entries(EXPECTED_MARKET_ALIASES).map(([expectedKey, aliases]) => {
+      const matchingKeys = marketKeys.filter(
+        (marketKey) => aliases.includes(normalizeDiagnosticMarketKey(marketKey)),
+      );
+      return [expectedKey, {
+        present: matchingKeys.length > 0,
+        eventCount: summary.events.filter(
+          (event) => matchingKeys.some((marketKey) => event.marketKeys.includes(marketKey)),
+        ).length,
+        selectionCount: matchingKeys.reduce(
+          (count, marketKey) => count + (selectionCounts[marketKey] ?? 0),
+          0,
+        ),
+      }];
+    }),
+  );
+
+  return { ...summary, marketKeys, selectionCounts, expectedMarketPresence };
+}
+
+function toDiagnosticBoard(payload) {
+  if (!Array.isArray(payload)) {
+    return payload;
+  }
+
+  const firstEvent = payload[0] ?? {};
+  return {
+    providerEventId: firstEvent.providerEventId,
+    leagueId: firstEvent.leagueId,
+    leagueNumber: firstEvent.leagueNumber,
+    weekNumber: firstEvent.weekNumber,
+    firstMatch: firstEvent.firstMatch ?? `${firstEvent.homeTeam || '?'} vs ${firstEvent.awayTeam || '?'}`,
+    events: payload,
+  };
+}
+
+function toDiagnosticQueueBoard(board) {
+  return {
+    ...board,
+    events: Array.isArray(board?.events) ? board.events : (board?.matches ?? []),
+  };
+}
+
+function getQueueDiagnosticBoards(payload) {
+  if (Array.isArray(payload?.boards)) {
+    return payload.boards;
+  }
+
+  return [payload?.currentBoard, ...(payload?.nextBoards ?? [])].filter(Boolean);
+}
+
+function logRawMarketSummary(board) {
+  const firstEvent = board?.events?.[0] ?? null;
+  const rawMarkets = Array.isArray(firstEvent?.markets)
+    ? firstEvent.markets.map((market) => {
+      const rawName = market?.name ?? null;
+      const mappedCanonicalMarketKey = FEED_MARKET_CODES[normalizeFeedMarketName(rawName)] ?? null;
+
+      return {
+        providerName: rawName,
+        providerCode: rawName,
+        selectionCount: getDiagnosticSelectionKeys(market?.selections).length,
+        mappedCanonicalMarketKey,
+        payloadMarketCode: market?.code ?? null,
+      };
+    })
+    : getDiagnosticMarketEntries(firstEvent?.markets).map(([marketKey, selections]) => ({
+      providerName: null,
+      providerCode: null,
+      selectionCount: getDiagnosticSelectionKeys(selections).length,
+      mappedCanonicalMarketKey: marketKey,
+      payloadMarketCode: marketKey,
+    }));
+
+  console.log('[SCRAPER RAW MARKET SUMMARY]', JSON.stringify({
+    providerEventId: board?.providerEventId,
+    firstEventId: firstEvent?.eventId ?? firstEvent?.providerMatchId,
+    rawMarkets,
+    unmappedMarkets: rawMarkets
+      .filter((market) => !market.mappedCanonicalMarketKey)
+      .map((market) => ({
+        providerName: market.providerName,
+        providerCode: market.providerCode,
+        payloadMarketCode: market.payloadMarketCode,
+      })),
+  }, null, 2));
+}
+
+function logBoardMarketDiagnostics(payload) {
+  if (!VH_DEBUG_MARKET_PAYLOADS) return;
+
+  const board = toDiagnosticBoard(payload);
+  const summary = buildMarketPayloadSummary(board);
+  console.log('[SCRAPER MARKET PAYLOAD]', JSON.stringify(summary, null, 2));
+  console.log(
+    `[SCRAPER MARKET SUMMARY] providerEventId=${summary.providerEventId ?? ''} ` +
+      `events=${summary.eventCount} marketKeys=${summary.marketKeys.join(',')} ` +
+      `selectionCounts=${Object.entries(summary.selectionCounts).map(([key, count]) => `${key}:${count}`).join(',')}`,
+  );
+  logRawMarketSummary(board);
+}
+
+function logQueueMarketDiagnostics(payload) {
+  if (!VH_DEBUG_MARKET_PAYLOADS) return;
+
+  const boards = getQueueDiagnosticBoards(payload).map(toDiagnosticQueueBoard);
+  console.log('[SCRAPER QUEUE MARKET PAYLOAD]', JSON.stringify({
+    boardCount: boards.length,
+    boards: boards.map(buildMarketPayloadSummary),
+  }, null, 2));
+  boards.forEach((board) => {
+    const summary = buildMarketPayloadSummary(board);
+    console.log(
+      `[SCRAPER MARKET SUMMARY] providerEventId=${summary.providerEventId ?? ''} ` +
+        `events=${summary.eventCount} marketKeys=${summary.marketKeys.join(',')} ` +
+        `selectionCounts=${Object.entries(summary.selectionCounts).map(([key, count]) => `${key}:${count}`).join(',')}`,
+    );
+  });
+  if (boards[0]) logRawMarketSummary(boards[0]);
+}
+
+function logFirstEventMarketChecks(payload, { queue = false } = {}) {
+  if (!VH_DEBUG_MARKET_PAYLOADS) return;
+
+  const board = queue
+    ? toDiagnosticQueueBoard(getQueueDiagnosticBoards(payload)[0])
+    : toDiagnosticBoard(payload);
+  const event = board?.events?.[0] ?? null;
+  const markets = event?.markets ?? {};
+  const fixture = `${event?.homeTeam || '?'} vs ${event?.awayTeam || '?'}`;
+  const providerEventId = board?.providerEventId ?? event?.providerEventId;
+  const eventId = event?.eventId ?? event?.providerMatchId;
+  const rawMarketNames = Array.isArray(markets)
+    ? markets.map((market) => market?.name).filter(Boolean)
+    : [];
+
+  console.log('[CANONICAL-MARKET-CHECK]', JSON.stringify({
+    providerEventId,
+    eventId,
+    fixture,
+    marketKeys: Object.keys(markets),
+    markets,
+  }, null, 2));
+
+  console.log('[RAW-MARKET-CHECK]', JSON.stringify({
+    providerEventId,
+    eventId,
+    fixture,
+    rawMarketNames,
+  }, null, 2));
 }
 
 function parseEnvSeconds(value, fallback) {
@@ -6205,6 +6442,8 @@ async function postCanonicalEvents(canonicalEvents) {
   let response;
 
   try {
+    logBoardMarketDiagnostics(canonicalEvents);
+    logFirstEventMarketChecks(canonicalEvents);
     response = await fetch(PROVIDER_IMPORT_EVENTS_URL, {
       method: 'POST',
       headers: {
@@ -6255,6 +6494,8 @@ async function postFeedEventsQueue(queuePayload) {
   let response;
 
   try {
+    logQueueMarketDiagnostics(queuePayload);
+    logFirstEventMarketChecks(queuePayload, { queue: true });
     response = await fetch(PROVIDER_IMPORT_QUEUE_URL, {
       method: 'POST',
       headers: {
@@ -7832,4 +8073,5 @@ module.exports = {
   createBrowserErrorConfirmationState,
   detectBrowserErrorPage,
   inspectPageState,
+  summarizeBoardMarkets,
 };
