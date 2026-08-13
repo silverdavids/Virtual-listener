@@ -6,6 +6,7 @@ const {
   createBrowserErrorConfirmationState,
   detectBrowserErrorPage,
   inspectPageState,
+  getBrowserErrorRestartDelay,
 } = require('./auto-sync');
 
 function fakeLocator(text = '') {
@@ -28,7 +29,8 @@ function fakePage({ url, title = '', bodyText = '', evaluateThrows = true }) {
     isClosed: () => false,
     locator: () => fakeLocator(bodyText),
     getByText: () => fakeLocator(bodyText),
-    evaluate: async () => {
+    evaluate: async (fn) => {
+      if (String(fn).includes('document.body')) return bodyText;
       if (evaluateThrows) throw new Error('dom unavailable');
       return {
         url,
@@ -49,6 +51,27 @@ test('detects about:neterror', async () => {
 
   assert.equal(result.detected, true);
   assert.equal(result.type, 'neterror');
+});
+
+for (const [label, bodyText] of [
+  ['Cloudflare 522', 'Error 522: Connection timed out Host Error'],
+  ['bad gateway', '502 Bad gateway'],
+  ['service unavailable', 'Error 503 Service unavailable'],
+  ['browser connection error', 'ERR_CONNECTION_REFUSED This site can\'t be reached'],
+]) {
+  test(`detects ${label} from visible text`, async () => {
+    const result = await detectBrowserErrorPage(fakePage({
+      url: 'https://globalbet.virtual-horizon.com/client/shop.jsp',
+      title: label,
+      bodyText,
+      evaluateThrows: false,
+    }));
+    assert.equal(result.detected, true);
+  });
+}
+
+test('browser error restart backoff is capped at 60 seconds', () => {
+  assert.deepEqual([1, 2, 3, 9].map(getBrowserErrorRestartDelay), [10_000, 30_000, 60_000, 60_000]);
 });
 
 test('detects about:certerror', async () => {
@@ -83,7 +106,7 @@ test('does not detect about:blank', () => {
 });
 
 test('confirmation timer prevents immediate restart', () => {
-  const confirmation = createBrowserErrorConfirmationState(30_000);
+  const confirmation = createBrowserErrorConfirmationState(10_000);
   const first = confirmation.observe({
     detected: true,
     type: 'neterror',
@@ -95,14 +118,14 @@ test('confirmation timer prevents immediate restart', () => {
     type: 'neterror',
     url: 'about:neterror?e=dnsNotFound',
     title: 'Server Not Found',
-  }, 20_000);
+  }, 10_999);
 
   assert.equal(first.confirmed, false);
   assert.equal(later.confirmed, false);
 });
 
 test('persistent error causes exactly one guarded restart', () => {
-  const confirmation = createBrowserErrorConfirmationState(30_000);
+  const confirmation = createBrowserErrorConfirmationState(10_000);
   let restartRequested = false;
   let restarts = 0;
   const requestRestart = () => {
@@ -119,7 +142,7 @@ test('persistent error causes exactly one guarded restart', () => {
   };
 
   assert.equal(confirmation.observe(error, 1000).confirmed, false);
-  if (confirmation.observe(error, 31_000).confirmed) requestRestart();
+  if (confirmation.observe(error, 11_000).confirmed) requestRestart();
   if (confirmation.observe(error, 45_000).confirmed) requestRestart();
 
   assert.equal(restarts, 1);

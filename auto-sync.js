@@ -122,8 +122,9 @@ const VH_RESULT_POST_MAX_ATTEMPTS = parseEnvInteger(process.env.VH_RESULT_POST_M
 const VH_NETWORK_ERROR_RELOAD_MS = parseEnvMilliseconds(process.env.VH_NETWORK_ERROR_RELOAD_MS, 30_000);
 const VH_NETWORK_ERROR_MAX_RELOADS = parseEnvInteger(process.env.VH_NETWORK_ERROR_MAX_RELOADS, 5);
 const VH_NETWORK_ERROR_RESTART_AFTER_MS = parseEnvMilliseconds(process.env.VH_NETWORK_ERROR_RESTART_AFTER_MS, 600_000);
-const VH_BROWSER_ERROR_CONFIRM_MS = parseEnvMilliseconds(process.env.VH_BROWSER_ERROR_CONFIRM_MS, 30_000);
-const VH_BROWSER_RESTART_COOLDOWN_MS = parseEnvMilliseconds(process.env.VH_BROWSER_RESTART_COOLDOWN_MS, 60_000);
+const VH_BROWSER_ERROR_CONFIRM_MS = parseEnvMilliseconds(process.env.VH_BROWSER_ERROR_CONFIRM_MS, 10_000);
+const VH_BROWSER_HEALTHY_RESET_MS = parseEnvMilliseconds(process.env.VH_BROWSER_HEALTHY_RESET_MS, 60_000);
+const VH_BROWSER_TEXT_SAMPLE_LENGTH = 100_000;
 
 let shutdownRequested = false;
 let shutdownInProgress = false;
@@ -131,7 +132,8 @@ let activeSession = null;
 let browserSessionNumber = 0;
 let browserRestartCount = 0;
 let lastRestartReason = null;
-let lastBrowserErrorRestartAt = 0;
+let browserRestartInProgress = false;
+let consecutiveBrowserErrorRestarts = 0;
 const resultCompletenessLedger = new Map();
 
 function parseEnvMilliseconds(value, fallback) {
@@ -198,6 +200,19 @@ function classifyBrowserErrorPage({ url = '', title = '', bodyText = '' } = {}) 
   }
 
   const textPatterns = [
+    { type: 'cloudflare-522', regex: /522.{0,80}connection timed out/i, scope: combinedText },
+    { type: 'connection-timed-out', regex: /connection timed out/i, scope: combinedText },
+    { type: 'host-error', regex: /host error/i, scope: combinedText },
+    { type: 'web-server-down', regex: /web server is down/i, scope: combinedText },
+    { type: 'bad-gateway', regex: /bad gateway/i, scope: combinedText },
+    { type: 'gateway-timeout', regex: /gateway time-?out/i, scope: combinedText },
+    { type: 'service-unavailable', regex: /service unavailable/i, scope: combinedText },
+    { type: 'http-error', regex: /error\s*(?:500|502|503|504|520|521|522|523|524)\b/i, scope: combinedText },
+    { type: 'connection-timed-out', regex: /err_connection_timed_out/i, scope: combinedText },
+    { type: 'connection-reset', regex: /err_connection_reset/i, scope: combinedText },
+    { type: 'connection-refused', regex: /err_connection_refused/i, scope: combinedText },
+    { type: 'name-not-resolved', regex: /err_name_not_resolved/i, scope: combinedText },
+    { type: 'site-unreachable', regex: /this site can.?t be reached/i, scope: combinedText },
     { type: 'problem-loading-page', regex: /problem loading page/i, scope: normalizedTitle },
     { type: 'server-not-found', regex: /server not found/i, scope: combinedText },
     { type: 'unable-to-connect', regex: /unable to connect/i, scope: combinedText },
@@ -229,7 +244,8 @@ async function detectBrowserErrorPage(page) {
   const url = page.url();
   const [title, bodyText] = await Promise.all([
     page.title().catch(() => ''),
-    page.locator('body').innerText({ timeout: 1000 }).catch(() => ''),
+    page.evaluate((maxLength) => document.body?.innerText?.slice(0, maxLength) || '', VH_BROWSER_TEXT_SAMPLE_LENGTH)
+      .catch(() => ''),
   ]);
 
   return classifyBrowserErrorPage({ url, title, bodyText });
@@ -361,6 +377,12 @@ function hashCanonicalEvents(canonicalEvents) {
     .createHash('sha256')
     .update(JSON.stringify(canonicalEvents))
     .digest('hex');
+}
+
+function getBrowserErrorRestartDelay(restartNumber) {
+  if (restartNumber <= 1) return 10_000;
+  if (restartNumber === 2) return 30_000;
+  return 60_000;
 }
 
 function getDiagnosticMarketEntries(markets) {
@@ -6811,6 +6833,13 @@ async function runBrowserSession() {
     networkState.lastNetworkFailureAt = 0;
     offlineDetected = false;
     browserErrorConfirmation.clear();
+    if (
+      consecutiveBrowserErrorRestarts > 0 &&
+      Date.now() - sessionStartedAt >= VH_BROWSER_HEALTHY_RESET_MS
+    ) {
+      consecutiveBrowserErrorRestarts = 0;
+      console.log('[BrowserHealth] Healthy Virtual Horizon traffic confirmed; restart backoff reset');
+    }
   };
 
   const recordNetworkFailure = (error, source = 'horizon-request') => {
@@ -6877,7 +6906,8 @@ async function runBrowserSession() {
   };
 
   const requestBrowserRestart = (reason, details = {}) => {
-    if (shutdownRequested || cleanupStarted || restartRequested) return false;
+    if (shutdownRequested || cleanupStarted || restartRequested || browserRestartInProgress) return false;
+    browserRestartInProgress = true;
     restartRequested = true;
     restartReason = String(reason || 'unknown').slice(0, 120);
     lastRestartReason = restartReason;
@@ -6893,7 +6923,7 @@ async function runBrowserSession() {
     if (resultLedgerInterval) clearInterval(resultLedgerInterval);
     watchdogInterval = null;
     resultLedgerInterval = null;
-    console.log('[restart] closing current browser');
+    console.log('[BrowserHealth] Closing unhealthy browser...');
     feedEventsCapture?.dispose();
     eventDetailCapture?.dispose();
     networkTraceRecorder?.dispose();
@@ -6918,15 +6948,19 @@ async function runBrowserSession() {
     page = null;
     context = null;
     browser = null;
+    console.log('[BrowserHealth] Browser closed');
   };
   const launchRuntime = async () => {
     if (browser || context || page) throw new Error('browser runtime already exists');
     browserSessionNumber += 1;
+    console.log('[BrowserHealth] Restarting browser...');
     console.log(`[restart] launching fresh browser session=${browserSessionNumber}`);
     browser = await firefox.launch({ headless: false });
     context = await browser.newContext();
     await configureBrowserContext(context);
     page = await context.newPage();
+    browserRestartInProgress = false;
+    console.log('[BrowserHealth] Browser restarted successfully');
     activeSession = { close: closeRuntime };
     const onUnexpectedFailure = (reason) => () => requestBrowserRestart(reason);
     browser.on('disconnected', onUnexpectedFailure('browser-disconnected'));
@@ -7589,10 +7623,9 @@ async function runBrowserSession() {
 
     browserErrorRecoveryRunning = true;
     try {
-      const cooldownRemainingMs = lastBrowserErrorRestartAt
-        ? Math.max(0, VH_BROWSER_RESTART_COOLDOWN_MS - (now - lastBrowserErrorRestartAt))
-        : 0;
-      lastBrowserErrorRestartAt = now;
+      consecutiveBrowserErrorRestarts += 1;
+      const delayMs = getBrowserErrorRestartDelay(consecutiveBrowserErrorRestarts);
+      console.log(`[BrowserHealth] Error page confirmed: ${browserError.type || 'unknown'}`);
       console.log(
         `action=restart-browser reason=confirmed-firefox-neterror type=${browserError.type || 'unknown'} ` +
           `durationMs=${confirmation.durationMs} url=${browserError.url || 'unknown'} ` +
@@ -7600,7 +7633,7 @@ async function runBrowserSession() {
       );
       requestBrowserRestart('confirmed-firefox-neterror', {
         browserError,
-        delayMs: Math.max(VH_RESTART_DELAY_MS, cooldownRemainingMs),
+        delayMs,
       });
       return true;
     } finally {
@@ -7627,6 +7660,7 @@ async function runBrowserSession() {
     console.log(`Realtime source: ${FEED_PATH} (${FEED_EVENTS_SOURCE})`);
     console.log(`Feed-events soft refresh: ${Math.round(FEED_EVENTS_SOFT_REFRESH_MS / 1000)} seconds`);
     console.log(`Feed-events inactivity reload: ${Math.round(FEED_EVENTS_INACTIVITY_RELOAD_MS / 1000)} seconds`);
+    console.log('[BrowserHealth] Virtual Horizon listener resumed');
 
     cycle += 1;
     if (TEST_BLOCK_FEED_EVENTS) {
@@ -8050,6 +8084,7 @@ async function main() {
     } catch (error) {
       if (!(error instanceof BrowserRestartError)) console.error(`[session] failure=${safeError(error)}`);
       delay = error?.details?.delayMs ?? (error?.details?.offline ? VH_OFFLINE_RETRY_DELAY_MS : VH_RESTART_DELAY_MS);
+      browserRestartInProgress = true;
     }
     if (!shutdownRequested) {
       browserRestartCount += 1;
@@ -8072,6 +8107,7 @@ module.exports = {
   classifyBrowserErrorPage,
   createBrowserErrorConfirmationState,
   detectBrowserErrorPage,
+  getBrowserErrorRestartDelay,
   inspectPageState,
   summarizeBoardMarkets,
 };
