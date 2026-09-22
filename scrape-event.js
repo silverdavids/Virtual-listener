@@ -1,13 +1,14 @@
 const { firefox } = require('playwright');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { LEAGUES } = require('./league-monitor');
+const { createProviderFeedClient } = require('./provider-feed-client');
 
 const AUTH_FILE = 'auth.json';
 const SHOP_URL = 'https://globalbet.virtual-horizon.com/client/shop.jsp';
-const EVENTS_URL = 'https://globalbet.virtual-horizon.com/engine/shop/feed/events?locale=en_US&gameType=FOOTBALL_LEAGUE&leagueId=21';
+const EVENTS_URL = 'https://globalbet.virtual-horizon.com/engine/shop/feed/events?locale=en_US&gameType=FOOTBALL_LEAGUE';
 const EVENT_DETAIL_URL = 'https://globalbet.virtual-horizon.com/engine/shop/feed/event';
 const DATA_DIR = 'data';
-const EVENTS_FILE = path.join(DATA_DIR, 'events-football-league-21.json');
 const EVENTS_DIR = path.join(DATA_DIR, 'events');
 const WAIT_AFTER_LOAD_MS = 30_000;
 
@@ -82,41 +83,6 @@ function extractEventIds(payload) {
   return [...eventIds];
 }
 
-function logNonOkResponse(label, response) {
-  if (response.status >= 200 && response.status < 300) {
-    return;
-  }
-
-  console.log(`${label} non-200 body preview:`);
-  console.log(response.body.slice(0, 500));
-}
-
-async function fetchFromPage(page, url) {
-  const response = await page.evaluate(async (requestUrl) => {
-    const fetchResponse = await fetch(requestUrl, {
-      credentials: 'include',
-      headers: {
-        accept: 'application/json, text/plain, */*',
-      },
-    });
-
-    return {
-      status: fetchResponse.status,
-      contentType: fetchResponse.headers.get('content-type'),
-      body: await fetchResponse.text(),
-    };
-  }, url);
-
-  try {
-    return {
-      ...response,
-      json: JSON.parse(response.body),
-    };
-  } catch {
-    throw new Error(`Expected JSON from ${url}, but received HTTP ${response.status}. Body: ${response.body.slice(0, 500)}`);
-  }
-}
-
 async function main() {
   await fs.access(AUTH_FILE).catch(() => {
     throw new Error(`Missing ${AUTH_FILE}. Run "npm run login" first.`);
@@ -128,29 +94,32 @@ async function main() {
   const browser = await firefox.launch({ headless: true });
   const context = await browser.newContext({ storageState: AUTH_FILE });
   const page = await context.newPage();
+  const client = createProviderFeedClient(page);
 
   try {
     await page.goto(SHOP_URL, { waitUntil: 'load' });
     await page.waitForTimeout(WAIT_AFTER_LOAD_MS);
 
-    const eventsResponse = await fetchFromPage(page, EVENTS_URL);
-    logNonOkResponse('Events list', eventsResponse);
-    await fs.writeFile(EVENTS_FILE, `${JSON.stringify(eventsResponse.json, null, 2)}\n`, 'utf8');
+    for (const league of LEAGUES) {
+      const eventsResponse = await client.fetch(`${EVENTS_URL}&leagueId=${league.id}`);
+      const EVENTS_FILE = path.join(DATA_DIR, `events-football-league-${league.id}.json`);
+      await fs.writeFile(EVENTS_FILE, `${JSON.stringify(eventsResponse.json, null, 2)}\n`, 'utf8');
 
-    const eventIds = extractEventIds(eventsResponse.json);
-    console.log(`Events list HTTP ${eventsResponse.status}`);
-    console.log(`Events found: ${eventIds.length}`);
+      const eventIds = [...new Set([...extractEventIds(eventsResponse.json), ...Object.values(eventsResponse.json.events ?? {}).map(board => board.a).filter(Boolean)])];
+      console.log(`Events list HTTP ${eventsResponse.status}`);
+      console.log(`Events found: ${eventIds.length}`);
 
-    for (const eventId of eventIds) {
-      const detailUrl = `${EVENT_DETAIL_URL}/${eventId}?locale=en_US`;
-      const detailResponse = await fetchFromPage(page, detailUrl);
-      const detailFile = path.join(EVENTS_DIR, `${eventId}.json`);
+      for (const eventId of eventIds) {
+        const detailUrl = `${EVENT_DETAIL_URL}/${eventId}?locale=en_US&leagueId=${league.id}`;
+        const detailResponse = await client.fetch(detailUrl);
+        const detailFile = path.join(EVENTS_DIR, `${league.id}-${eventId}.json`);
 
-      logNonOkResponse(`Event ${eventId}`, detailResponse);
-      await fs.writeFile(detailFile, `${JSON.stringify(detailResponse.json, null, 2)}\n`, 'utf8');
-      console.log(`Fetched event ${eventId}: HTTP ${detailResponse.status}`);
+        await fs.writeFile(detailFile, `${JSON.stringify(detailResponse.json, null, 2)}\n`, 'utf8');
+        console.log(`Fetched event ${eventId}: HTTP ${detailResponse.status}`);
+      }
     }
   } finally {
+    client.dispose();
     await browser.close();
   }
 }

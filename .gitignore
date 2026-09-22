@@ -1,7 +1,36 @@
-node_modules
-auth.json
+/node_modules/
+/data/
+/evidence/
+
+# Credentials and browser storage. Keep the configuration template.
 .env
-data/*.json
-data/*.txt
-data/events/*.json
-data/captured/*.json
+.env.*
+!.env.example
+auth.json
+auth-*.json
+authentication*.json
+session*.json
+cookie*.json
+token*.json
+storage-state*.json
+storageState*.json
+.auth/
+
+# Runtime captures and recovery files, including custom state locations.
+*.tmp
+*.corrupt-*.bak
+*.log
+*.jsonl
+*.har
+*.png
+*.jpg
+*.jpeg
+*.webp
+screenshots/
+implementation-copy*/
+live-implementation/
+api-queue-fix/
+LiveSqlBridge/
+
+# Reviewed fixture required by the lifecycle tests.
+!test-fixtures/provider-progress.json

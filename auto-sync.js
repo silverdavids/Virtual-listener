@@ -7,6 +7,8 @@ const { stdin: input, stdout: output } = require('node:process');
 const { getFixtures, normalizeEvent, values } = require('./analyze-feed');
 const { mapEvent, toIsoTime } = require('./canonical-market-mapper');
 const { normalizeProviderTimestamp } = require('./provider-timestamp');
+const { LEAGUES, leagueEventKey, createLeagueMonitor, createLeagueRefreshScheduler } = require('./league-monitor');
+const { createLiveStateMonitor } = require('./provider-live-state');
 const {
   validateCanonicalBoard,
   logBlockedCanonicalBoard,
@@ -67,6 +69,18 @@ const PROVIDER_IMPORT_RESULTS_URL = normalizeUrl(
   `${VIRTUAL_API_BASE_URL}/api/provider-imports/virtual-horizon/results`,
 );
 const PROVIDER_IMPORT_HEALTH_URL = `${VIRTUAL_API_BASE_URL}/api/provider-imports/health`;
+let liveStateMonitor;
+const initializeLiveStateMonitor = () => createLiveStateMonitor({
+  file: process.env.VH_LIVE_STATE_FILE || path.join(__dirname, 'data', 'provider-live-state.json'),
+  post: async payload => {
+    if (TEST_BLOCK_FEED_EVENTS) return;
+    const response = await fetch(`${VIRTUAL_API_BASE_URL}/api/provider-imports/virtual-horizon/live-state`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload), signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) throw new Error(`live state HTTP ${response.status}`);
+  },
+});
 const CYCLE_POLL_SECONDS = Math.min(3, Math.max(2, parseEnvSeconds(process.env.CYCLE_POLL_SECONDS, 3)));
 const FULL_FEED_REFRESH_SECONDS = parseEnvSeconds(process.env.FULL_FEED_REFRESH_SECONDS, 300);
 const FEED_URL_MARKER = '/engine/shop/feed/events';
@@ -76,7 +90,7 @@ const LOGIN_TIMEOUT_MS = 30_000;
 const STARTUP_EVENT_DETAIL_WAIT_MS = 20_000;
 const TRANSITION_TEXT = 'NO MORE BETS, GAME IS KICKING OFF';
 const SKIP_TO_NEXT_GAMES_TEXT = 'Skip to next games (Esc)';
-const FEED_PATH = '/engine/shop/feed/events?locale=en_US&gameType=FOOTBALL_LEAGUE&leagueId=21';
+const FEED_PATHS = LEAGUES.map(league => `/engine/shop/feed/events?locale=en_US&gameType=FOOTBALL_LEAGUE&leagueId=${league.id}`);
 const FEED_EVENTS_SOFT_REFRESH_MS = 30_000;
 const FEED_EVENTS_INACTIVITY_RELOAD_MS = 120_000;
 const STARTUP_FEED_WARMUP_MS = 3_000;
@@ -782,7 +796,7 @@ function mapFeedMatch(row, boardMeta) {
     matchId: providerMatchId,
     providerMatchId,
     sport: 'FOOTBALL',
-    leagueId: String(boardMeta.leagueNumber ?? ''),
+    leagueId: String(boardMeta.providerLeagueId ?? ''),
     leagueNumber: String(boardMeta.leagueNumber ?? ''),
     providerLeagueId: String(boardMeta.providerLeagueId ?? ''),
     leagueName: boardMeta.leagueName,
@@ -794,7 +808,7 @@ function mapFeedMatch(row, boardMeta) {
   };
 }
 
-function parseFeedEventsBoardFromBoard(board) {
+function parseFeedEventsBoardFromBoard(board, requestedLeagueId) {
   if (!board) {
     throw new Error('feed-events response missing events[0]');
   }
@@ -802,11 +816,16 @@ function parseFeedEventsBoardFromBoard(board) {
   const matches = values(board?.f?.b?.c?.c);
   const firstMatch = matches[0]?.b ?? matches[0] ?? {};
   const firstTeams = firstMatch?.i?.a?.b ?? {};
-  const providerLeagueId = board?.f?.b?.a?.a?.d ?? board?.f?.b?.a?.d ?? null;
+  const providerLeagueId = board?.f?.b?.a?.a?.d ?? board?.f?.b?.a?.d ?? requestedLeagueId ?? null;
+  if (requestedLeagueId && providerLeagueId && String(providerLeagueId) !== String(requestedLeagueId)) {
+    throw new Error(`league mismatch requested=${requestedLeagueId} payload=${providerLeagueId}`);
+  }
   const leagueNumber = board?.f?.b?.c?.e || providerLeagueId || null;
   const weekNumber = board?.f?.b?.c?.a ?? null;
   const boardMeta = {
     source: FEED_EVENTS_SOURCE,
+    availabilityStatus: board?.f?.b?.c?.b ?? null,
+    providerStatus: board?.c ?? null,
     provider: 'VirtualHorizon',
     providerEventId: String(board?.a ?? ''),
     leagueName: board?.f?.b?.a?.a?.a ?? board?.f?.b?.a?.a ?? null,
@@ -815,6 +834,7 @@ function parseFeedEventsBoardFromBoard(board) {
     leagueNumber: leagueNumber === null || leagueNumber === undefined ? null : String(leagueNumber),
     startTime: board?.d ?? null,
     endTime: board?.e ?? board?.endTime ?? board?.finishTime ?? null,
+    reliableEndAt: toFeedIsoTime(board?.finishTime ?? board?.endTime ?? null),
     countdownSeconds: toCycleSeconds(board?.countdown ?? board?.countdownSeconds ?? board?.remainingSeconds ?? board?.remainingTime),
     firstMatch: `${firstTeams?.a?.a ?? ''} vs ${firstTeams?.b?.a ?? ''}`,
     expectedMatchCount: VIRTUAL_BOARD_EXPECTED_MATCH_COUNT,
@@ -826,7 +846,7 @@ function parseFeedEventsBoardFromBoard(board) {
 
   return {
     ...boardMeta,
-    leagueId: String(boardMeta.leagueNumber ?? ''),
+    leagueId: String(boardMeta.providerLeagueId ?? ''),
     events,
   };
 }
@@ -835,11 +855,11 @@ function parseFeedEventsBoard(feed) {
   return parseFeedEventsBoardFromBoard(getCurrentFeedBoard(feed));
 }
 
-function parseFeedEventsBoards(feed) {
+function parseFeedEventsBoards(feed, requestedLeagueId) {
   return values(feed?.events)
     .map((board) => {
       try {
-        return parseFeedEventsBoardFromBoard(board);
+        return parseFeedEventsBoardFromBoard(board, requestedLeagueId);
       } catch {
         return null;
       }
@@ -937,16 +957,24 @@ function mapFeedQueueMatch(event) {
 }
 
 function buildFeedEventsQueuePayload(boardPayloads, capturedAt) {
+  const leagueId = String(boardPayloads[0]?.leagueId ?? '');
+  if (!leagueId || boardPayloads.some(board => String(board.leagueId) !== leagueId)) {
+    throw new Error('Queue must contain exactly one identified league');
+  }
   return {
     provider: 'VirtualHorizon',
     source: 'feed-events-queue',
-    leagueId: String(boardPayloads[0]?.leagueNumber || '21'),
+    leagueId,
     capturedAt: new Date(capturedAt).toISOString(),
     boards: boardPayloads.map((boardPayload, index) => {
       const nextBoardPayload = boardPayloads[index + 1] ?? null;
       const endAt = toQueueIsoTime(boardPayload.endTime);
 
       return {
+        leagueId,
+        leagueNumber: boardPayload.leagueNumber,
+        availabilityStatus: boardPayload.availabilityStatus,
+        providerStatus: boardPayload.providerStatus,
         providerEventId: boardPayload.providerEventId,
         weekNumber: boardPayload.weekNumber,
         firstMatch: boardPayload.firstMatch,
@@ -1344,6 +1372,7 @@ function classifyEventDetailPacket(json, url) {
       event?.f?.b?.a?.d ??
       event?.leagueId ??
       event?.providerLeagueId ??
+      new URL(url, 'https://globalbet.virtual-horizon.com').searchParams.get('leagueId') ??
       '',
   );
   const leagueName = event?.f?.b?.a?.a?.a ?? event?.f?.b?.a?.a ?? event?.leagueName ?? '';
@@ -1526,17 +1555,18 @@ function createResultLedgerEntry(providerEventId) {
   };
 }
 
-function getResultLedgerEntry(providerEventId) {
+function getResultLedgerEntry(providerEventId, leagueId) {
   const normalizedProviderEventId = normalizeProviderEventId(providerEventId);
-  if (!normalizedProviderEventId) {
+  if (!normalizedProviderEventId || !leagueId) {
     return null;
   }
 
-  if (!resultCompletenessLedger.has(normalizedProviderEventId)) {
-    resultCompletenessLedger.set(normalizedProviderEventId, createResultLedgerEntry(normalizedProviderEventId));
+  const key = leagueEventKey(leagueId, normalizedProviderEventId);
+  if (!resultCompletenessLedger.has(key)) {
+    resultCompletenessLedger.set(key, { ...createResultLedgerEntry(normalizedProviderEventId), leagueId: String(leagueId) });
   }
 
-  return resultCompletenessLedger.get(normalizedProviderEventId);
+  return resultCompletenessLedger.get(key);
 }
 
 function updateMissingLedgerMetadata(entry, metadata = {}) {
@@ -1566,14 +1596,14 @@ function getBoardScheduledEndAt(boardPayload, cycleTiming = null) {
 
 function registerResultLedgerEventBoard(boardPayload, result = {}, source = FEED_EVENTS_SOURCE) {
   const providerEventId = normalizeProviderEventId(boardPayload?.providerEventId ?? result.providerEventId);
-  const entry = getResultLedgerEntry(providerEventId);
+  const entry = getResultLedgerEntry(providerEventId, boardPayload?.providerLeagueId ?? boardPayload?.leagueId);
   if (!entry) return null;
 
   const expectedMatchCount = Array.isArray(boardPayload?.events) && boardPayload.events.length > 0
     ? boardPayload.events.length
     : null;
   updateMissingLedgerMetadata(entry, {
-    leagueId: String(boardPayload?.leagueNumber ?? boardPayload?.leagueId ?? ''),
+    leagueId: String(boardPayload?.providerLeagueId ?? boardPayload?.leagueId ?? ''),
     leagueName: boardPayload?.leagueName ?? boardPayload?.events?.[0]?.leagueName ?? '',
     weekNumber: String(boardPayload?.weekNumber ?? ''),
     firstMatch: boardPayload?.firstMatch ?? '',
@@ -1591,7 +1621,7 @@ function registerResultLedgerEventBoard(boardPayload, result = {}, source = FEED
   entry.lastUpdatedAt = Date.now();
 
   console.log(
-    `RESULT-LEDGER-REGISTERED providerEventId=${entry.providerEventId} ` +
+    `RESULT-LEDGER-REGISTERED league=${entry.leagueId} providerEventId=${entry.providerEventId} ` +
       `week=${entry.weekNumber || 'not found'} expected=${entry.expectedMatchCount ?? 'unknown'} ` +
       `endAt=${entry.scheduledEndAt || 'unknown'} source=${source}`,
   );
@@ -1622,7 +1652,7 @@ function getResultPayloadExpectedMatchCount(packet, monitorPayload) {
 
 function recordResultLedgerObservation(packet, monitorPayload) {
   const providerEventId = normalizeProviderEventId(packet?.providerEventId ?? monitorPayload?.providerEventId);
-  const entry = getResultLedgerEntry(providerEventId);
+  const entry = getResultLedgerEntry(providerEventId, packet?.resultsPayload?.leagueId || monitorPayload?.leagueId);
   if (!entry) return null;
 
   const now = Date.now();
@@ -1701,7 +1731,7 @@ function markResultPostSuccess(entry, monitorPayload) {
   entry.status = 'RESULTS_COMPLETE';
   entry.lastUpdatedAt = now;
   console.log(
-    `RESULT-POST-SUCCESS providerEventId=${entry.providerEventId} ` +
+    `RESULT-POST-SUCCESS league=${entry.leagueId} providerEventId=${entry.providerEventId} ` +
       `matches=${monitorPayload.matches.length} attempt=${entry.resultPostAttempts}`,
   );
   console.log(`RESULT-COMPLETE providerEventId=${entry.providerEventId} expected=${entry.expectedMatchCount ?? monitorPayload.matches.length} received=${entry.receivedMatchCount}`);
@@ -1715,7 +1745,7 @@ function markResultPostFailure(entry, monitorPayload, error) {
   entry.status = 'RESULT_POST_FAILED';
   entry.lastUpdatedAt = now;
   console.log(
-    `RESULT-POST-FAILED providerEventId=${entry.providerEventId} matches=${monitorPayload.matches.length} ` +
+    `RESULT-POST-FAILED league=${entry.leagueId} providerEventId=${entry.providerEventId} matches=${monitorPayload.matches.length} ` +
       `attempt=${entry.resultPostAttempts} error="${entry.lastResultPostError}"`,
   );
 }
@@ -1724,6 +1754,22 @@ async function postResultMonitorPayloadWithLedger(entry, monitorPayload, { retry
   if (!entry) {
     return postResultMonitorPayload(monitorPayload);
   }
+
+  if (entry.resultPostSucceededAt) return { ok: true, duplicate: true };
+  if (entry.postPromise) return entry.postPromise;
+  if (entry.resultPostFailedAt && !retry) return { ok: false, deferred: true };
+  entry.postPromise = postResultMonitorPayloadWithLedgerOnce(entry, monitorPayload, { retry });
+  try { return await entry.postPromise; } finally { entry.postPromise = null; }
+}
+
+function hasCompleteBoardResults(board) {
+  // resultsReceivedAt is set only when all expected fixtures have numeric scores.
+  // Import failure/overdue status is not completion, and successful SQL posting
+  // is not required for the provider's finished event to leave the live queue.
+  return Boolean(resultCompletenessLedger.get(leagueEventKey(board.leagueId, board.providerEventId))?.resultsReceivedAt);
+}
+
+async function postResultMonitorPayloadWithLedgerOnce(entry, monitorPayload, { retry }) {
 
   markResultPostAttempt(entry);
   if (retry) {
@@ -1834,7 +1880,7 @@ async function checkResultCompletenessLedger() {
 
 async function processResultMonitorPacket(packet) {
   logResultScores(packet);
-  const monitorPayload = buildResultMonitorPayload(packet);
+  let monitorPayload = buildResultMonitorPayload(packet);
   const observation = recordResultLedgerObservation(packet, monitorPayload);
   let monitorResult = null;
 
@@ -1845,8 +1891,11 @@ async function processResultMonitorPacket(packet) {
     };
   }
 
+  monitorPayload = { ...monitorPayload, matches: Object.values(observation.entry.resultRowsByProviderMatchId) };
+
   try {
     monitorResult = await postResultMonitorPayloadWithLedger(observation.entry, monitorPayload);
+    if (monitorResult?.deferred) return { monitorPayload, monitorResult };
     console.log(
       `RESULT-MONITOR-POSTED providerEventId=${monitorPayload.providerEventId || 'not found'} ` +
         `matches=${monitorPayload.matches.length} ok=${monitorResult.ok ?? 'unknown'}`,
@@ -2733,8 +2782,8 @@ function createFeedEventsCapture(page, options = {}) {
   const feedEventsByWeekNumber = new Map();
   const feedEventsByFirstMatch = new Map();
   const feedEventsByCompositeKey = new Map();
-  let latestFeedEventsRaw = null;
-  let latestMappedFeed = null;
+  // Compatibility view for the DOM scheduler; authoritative feeds live in leagueMonitor.states.
+  let visibleMappedFeed = null;
   let feedEventsResponseId = 0;
 
   const getCycle = options.getCycle ?? (() => 0);
@@ -2765,10 +2814,11 @@ function createFeedEventsCapture(page, options = {}) {
     };
 
     if (boardPayload.providerEventId) {
-      if (!feedEventsByProviderEventId.has(boardPayload.providerEventId)) {
-        feedEventsByProviderEventId.set(boardPayload.providerEventId, []);
+      const boardKey = leagueEventKey(boardPayload.leagueId, boardPayload.providerEventId);
+      if (!feedEventsByProviderEventId.has(boardKey)) {
+        feedEventsByProviderEventId.set(boardKey, []);
       }
-      feedEventsByProviderEventId.get(boardPayload.providerEventId).push(entry);
+      feedEventsByProviderEventId.get(boardKey).push(entry);
     }
 
     if (boardPayload.weekNumber) {
@@ -2786,6 +2836,7 @@ function createFeedEventsCapture(page, options = {}) {
     }
 
     const compositeKey = [
+      boardPayload.leagueId || 'unknown',
       boardPayload.providerEventId || 'unknown',
       boardPayload.weekNumber || 'unknown',
       boardPayload.firstMatch || 'unknown',
@@ -2841,6 +2892,8 @@ function createFeedEventsCapture(page, options = {}) {
       return;
     }
 
+    const captureEpoch = options.getRequestEpoch?.(response.request()) ?? options.getMonitoringEpoch?.();
+    if (captureEpoch !== options.getMonitoringEpoch?.()) return;
     const capturePromise = (async () => {
       const request = response.request();
 
@@ -2868,6 +2921,38 @@ function createFeedEventsCapture(page, options = {}) {
       }
 
       const json = await response.json();
+      if (captureEpoch !== options.getMonitoringEpoch?.()) return;
+      const requestedLeagueId = new URL(response.url()).searchParams.get('leagueId');
+      if (options.leagueMonitor) {
+        const results = await options.leagueMonitor.ingest(json, requestedLeagueId, captureEpoch,
+          options.getRequestOrder?.(request));
+        // Keep the DOM scheduler's compatibility view scoped to the visible board.
+        // Off-screen feeds live exclusively in the monitor's league maps.
+        const visible = getVisibleFirstMatch ? await getVisibleFirstMatch().catch(() => null) : null;
+        const boards = parseFeedEventsBoards(json, requestedLeagueId);
+        const boardPayload = boards.find(board => board.firstMatch === getVisibleText(visible));
+        if (boardPayload) {
+          const capture = { url: response.url(), json, boardPayload, capturedAt: Date.now(),
+            generation: lastPostedState?.generation ?? 0, mode: 'response-listener' };
+          visibleMappedFeed = boardPayload;
+          captures.push(capture);
+          while (captures.length > 50) captures.shift();
+          boards.forEach(board => storeFeedEventsBoardPayload(capture, board));
+          onFeedEvents200(capture);
+          const result = results?.find(result => result?.providerEventId === boardPayload.providerEventId);
+          if (result) {
+            if (result.posted) {
+              lastPostedState.providerEventId = boardPayload.providerEventId;
+              clearPendingDomRefresh();
+              clearLastRolloverPostFailed();
+            }
+            const visibleResult = { ...result, matchesVisible: true, domFirst: boardPayload.firstMatch };
+            recordProcessedResult(capture, visibleResult);
+            onProcessed(visibleResult);
+          }
+        }
+        return;
+      }
       feedEventsResponseId += 1;
       let boardPayload = null;
       let boardPayloads = [];
@@ -2892,8 +2977,7 @@ function createFeedEventsCapture(page, options = {}) {
       };
       postFeedEventsQueueInBackground(getCycle(), boardPayloads, capture.capturedAt);
 
-      latestFeedEventsRaw = json;
-      latestMappedFeed = boardPayload;
+      visibleMappedFeed = boardPayload;
       captures.push(capture);
       boardPayloads.forEach((payload) => {
         storeFeedEventsBoardPayload(capture, payload);
@@ -3158,7 +3242,7 @@ function createFeedEventsCapture(page, options = {}) {
     },
     async latestMapped() {
       await Promise.allSettled(pending);
-      return latestMappedFeed;
+      return visibleMappedFeed;
     },
     findByFirstMatch(firstMatch) {
       const matches = feedEventsByFirstMatch.get(firstMatch) ?? [];
@@ -3214,12 +3298,10 @@ function createFeedEventsCapture(page, options = {}) {
           generation: options.generation ?? latestCapture.generation,
         };
         captures.push(preservedCapture);
-        latestFeedEventsRaw = preservedCapture.json;
-        latestMappedFeed = preservedCapture.boardPayload ?? latestMappedFeed;
+        visibleMappedFeed = preservedCapture.boardPayload ?? visibleMappedFeed;
         return true;
       } else {
-        latestFeedEventsRaw = null;
-        latestMappedFeed = null;
+        visibleMappedFeed = null;
       }
 
       return false;
@@ -5521,7 +5603,7 @@ async function postFeedEventsBoard(cycle, boardPayload, lastPostedState, meta = 
     `cycle=${cycle} source=${FEED_EVENTS_SOURCE} first=${boardPayload.firstMatch} events=${counts.eventCount} posted reason=ok batchId=${result.batchId ?? ''} errors=${JSON.stringify(result.errors ?? [])}`,
   );
   console.log(
-    `VIRTUAL-API-POSTED source=${FEED_EVENTS_SOURCE} providerEventId=${boardPayload.providerEventId || 'not found'} ` +
+    `VIRTUAL-API-POSTED league=${boardPayload.leagueId} providerEventId=${boardPayload.providerEventId || 'not found'} source=${FEED_EVENTS_SOURCE} ` +
       `week=${boardPayload.weekNumber || 'not found'} firstMatch=${boardPayload.firstMatch || 'not found'}`,
   );
   registerResultLedgerEventBoard(boardPayload, { ...feedResultMeta, cycleTiming }, FEED_EVENTS_SOURCE);
@@ -5615,8 +5697,8 @@ async function postCanonicalEventsForSource(cycle, source, canonicalEvents, last
   }
 
   const nextHash = hashCanonicalEvents(eventsToPost);
-
-  if (lastPostedHashes.get(source) === nextHash) {
+  const sourceKey = `${source}:${leagueEventKey(eventsToPost[0]?.leagueId, eventsToPost[0]?.providerEventId)}`;
+  if (lastPostedHashes.get(sourceKey) === nextHash) {
     logSourceResult(cycle, source, eventsToPost, 'skipped', 'unchanged', extra);
     return {
       posted: false,
@@ -5648,7 +5730,7 @@ async function postCanonicalEventsForSource(cycle, source, canonicalEvents, last
   );
 
   const result = await postCanonicalEvents(eventsToPost);
-  lastPostedHashes.set(source, nextHash);
+  lastPostedHashes.set(sourceKey, nextHash);
   logSocketUpdateEmission(cycle, source, eventsToPost, result);
   logSourceResult(cycle, source, eventsToPost, 'posted', 'ok', {
     ...extra,
@@ -6330,7 +6412,7 @@ async function waitForFeedEventsReady(feedEventsCapture, timeoutMs = 30_000, exp
     const capturedFeed = await feedEventsCapture?.latest();
     if (capturedFeed && (expectedGeneration === null || capturedFeed.generation === expectedGeneration)) {
       try {
-        const boardPayload = parseFeedEventsBoard(capturedFeed.json);
+        const boardPayload = capturedFeed.boardPayload ?? parseFeedEventsBoard(capturedFeed.json);
         return {
           ok: true,
           reason: FEED_EVENTS_SOURCE,
@@ -6369,7 +6451,7 @@ async function readLatestFeedClockSnapshot(feedEventsCapture, expectedGeneration
   }
 
   try {
-    const boardPayload = parseFeedEventsBoard(capturedFeed.json);
+    const boardPayload = capturedFeed.boardPayload ?? parseFeedEventsBoard(capturedFeed.json);
     return {
       providerEventId: boardPayload.providerEventId ?? '',
       week: boardPayload.weekNumber ?? '',
@@ -6513,11 +6595,17 @@ async function postFeedEventsQueue(queuePayload) {
     };
   }
 
+  for (const board of queuePayload.boards ?? []) {
+    const validation = validateCanonicalBoard({ ...board, events: board.matches });
+    if (!validation.valid) throw new Error(`invalid-canonical-queue-board providerEventId=${board.providerEventId}`);
+  }
+
   let response;
 
   try {
     logQueueMarketDiagnostics(queuePayload);
     logFirstEventMarketChecks(queuePayload, { queue: true });
+    console.log(`QUEUE-POST-BODY league=${queuePayload.leagueId} weeks=${queuePayload.boards.map(board => board.weekNumber)} providerEventIds=${queuePayload.boards.map(board => board.providerEventId)} boardCount=${queuePayload.boards.length}`);
     response = await fetch(PROVIDER_IMPORT_QUEUE_URL, {
       method: 'POST',
       headers: {
@@ -6553,6 +6641,8 @@ async function postFeedEventsQueue(queuePayload) {
     throw error;
   }
 
+  console.log(`QUEUE-POST-RESPONSE league=${queuePayload.leagueId} status=${response.status} success=${payload?.success ?? payload?.ok ?? 'unknown'}`);
+  if (payload?.success === false) throw new Error('Queue import returned success=false');
   return payload ?? {};
 }
 
@@ -6719,6 +6809,13 @@ async function runBrowserSession() {
   let sessionAuthMonitor = null;
   let watchdogInterval = null;
   let resultLedgerInterval = null;
+  let leagueMonitorInterval = null;
+  let monitoringEpoch = 0;
+  let leagueMonitoringReadyAt = Infinity;
+  let providerAuthorization = null;
+  const requestEpochs = new WeakMap();
+  const requestOrders = new WeakMap();
+  let nextRequestOrder = 0;
   let watchdogRunning = false;
   let resultLedgerCheckRunning = false;
   let cleanupStarted = false;
@@ -6779,6 +6876,94 @@ async function runBrowserSession() {
     startupWarmup: createStartupWarmupState(null),
   };
   const rl = readline.createInterface({ input, output });
+  const leagueMonitor = createLeagueMonitor({
+    parseBoards: parseFeedEventsBoards,
+    buildQueue: buildFeedEventsQueuePayload,
+    postQueue: postFeedEventsQueue,
+    isComplete: hasCompleteBoardResults,
+    postBoard: async (board, state, capturedAt) => {
+      const result = await postFeedEventsBoard(cycle, board, state, {
+        feedReceivedAt: capturedAt, generation: state.generation,
+      });
+      if (result?.posted) activity.lastSuccessfulPostAt = Date.now();
+      activity.lastSuccessfulParseAt = Date.now();
+      return result;
+    },
+  });
+  const ingestLeagueFeed = async (json, leagueId, epoch = monitoringEpoch, responseOrder = ++nextRequestOrder) => {
+    const isCurrent = () => epoch === monitoringEpoch && !TEST_BLOCK_FEED_EVENTS &&
+      Date.now() >= leagueMonitoringReadyAt && !cleanupStarted;
+    if (!isCurrent()) return;
+    liveStateMonitor.observe(json, leagueId);
+    return leagueMonitor.ingest(json, leagueId, Date.now(), isCurrent, responseOrder);
+  };
+  const fetchLeagueJson = async (requestPath) => {
+    const requestEpoch = monitoringEpoch;
+    if (!providerAuthorization) throw new Error('waiting for authenticated native feed');
+    const result = await page.evaluate(async ({ requestPath, authorization }) => {
+      if (location.origin !== 'https://globalbet.virtual-horizon.com') throw new Error('provider origin unavailable');
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      try {
+        const response = await fetch(new URL(requestPath, location.origin), {
+          credentials: 'include', headers: { accept: 'application/json, text/plain, */*', authorization },
+          signal: controller.signal,
+        });
+        return { status: response.status, body: await response.text() };
+      } finally { clearTimeout(timeout); }
+    }, { requestPath, authorization: providerAuthorization });
+    if (requestEpoch !== monitoringEpoch || cleanupStarted) throw new Error('stale monitoring session');
+    if (result.status === 401 || result.status === 403) {
+      noteAuthenticationFailure({ reason: 'league-monitor-auth', status: result.status, url: requestPath });
+    }
+    if (result.status !== 200) throw new Error(`provider status=${result.status}`);
+    return JSON.parse(result.body);
+  };
+  const leagueScheduler = createLeagueRefreshScheduler({
+    isReady: () => !cleanupStarted && Date.now() >= leagueMonitoringReadyAt && !TEST_BLOCK_FEED_EVENTS,
+    refreshLeague: async (league, isCurrent) => {
+      if (!isCurrent()) return;
+      const epoch = monitoringEpoch;
+      const responseOrder = ++nextRequestOrder;
+      const json = await fetchLeagueJson(`/engine/shop/feed/events?locale=en_US&gameType=FOOTBALL_LEAGUE&leagueId=${league.id}`);
+      if (!isCurrent()) return;
+      const boards = parseFeedEventsBoards(json, league.id);
+      if (!boards.length) throw new Error('no identified league boards');
+      if (!leagueMonitor.states.get(league.id).discovered) {
+        console.log(`LEAGUE-DISCOVERED name=${league.name} league=${league.id}`);
+        leagueMonitor.states.get(league.id).discovered = true;
+      }
+      await ingestLeagueFeed(json, league.id, epoch, responseOrder);
+    },
+    pollResults: async (league, isCurrent) => {
+      // The process-level ledger survives browser sessions and visible-board resets.
+      const pending = [...resultCompletenessLedger.values()]
+        .filter(entry => !entry.resultPostSucceededAt && entry.leagueId === league.id)
+        .sort((a, b) => (a.lastPollAt || 0) - (b.lastPollAt || 0));
+      let polled = 0;
+      for (const entry of pending) {
+        if (!isCurrent() || polled >= 5) break;
+        const endAt = Date.parse(entry.scheduledEndAt || entry.scheduledStartAt || '');
+        if (Number.isFinite(endAt) && Date.now() < endAt) continue;
+        entry.lastPollAt = Date.now();
+        polled += 1;
+        try {
+          const requestPath = `/engine/shop/feed/event/${encodeURIComponent(entry.providerEventId)}?locale=en_US&leagueId=${entry.leagueId}`;
+          const json = await fetchLeagueJson(requestPath);
+          if (!isCurrent()) return;
+          const packet = classifyEventDetailPacket(json, requestPath);
+          if (packet.resultsPayload.leagueId && packet.resultsPayload.leagueId !== entry.leagueId) {
+            throw new Error('result league mismatch');
+          }
+          packet.resultsPayload.leagueId = entry.leagueId;
+          if (packet.hasResults) await processResultMonitorPacket(packet);
+        } catch (error) {
+          console.log(`LEAGUE-RESULT-RETRY league=${entry.leagueId} providerEventId=${entry.providerEventId} reason=${safeError(error)}`);
+        }
+      }
+    },
+    onError: (error, league, kind) => console.log(`LEAGUE-${kind === 'feed' ? 'REFRESH-FAILED' : 'RESULT-RETRY'} league=${league.id} reason=${safeError(error)}`),
+  });
 
   logSyncTargets();
 
@@ -6921,6 +7106,9 @@ async function runBrowserSession() {
     cleanupStarted = true;
     if (watchdogInterval) clearInterval(watchdogInterval);
     if (resultLedgerInterval) clearInterval(resultLedgerInterval);
+    if (leagueMonitorInterval) clearInterval(leagueMonitorInterval);
+    monitoringEpoch += 1;
+    leagueScheduler.reset();
     watchdogInterval = null;
     resultLedgerInterval = null;
     console.log('[BrowserHealth] Closing unhealthy browser...');
@@ -6967,7 +7155,25 @@ async function runBrowserSession() {
     page.on('close', onUnexpectedFailure('page-closed'));
     page.on('crash', onUnexpectedFailure('page-crashed'));
     context.on('close', onUnexpectedFailure('context-closed'));
+    page.on('request', request => {
+      requestEpochs.set(request, monitoringEpoch);
+      requestOrders.set(request, ++nextRequestOrder);
+    });
     page.on('response', (response) => {
+      const providerUrl = new URL(response.url());
+      if (/\/engine\/shop\/feed\/event\/[^/?#]+/.test(providerUrl.pathname) && response.status() === 200) {
+        const epoch = requestEpochs.get(response.request());
+        void response.json().then(json => {
+          if (epoch === monitoringEpoch && !cleanupStarted && !TEST_BLOCK_FEED_EVENTS) {
+            liveStateMonitor.observe(json, providerUrl.searchParams.get('leagueId'));
+          }
+        }).catch(() => {});
+      }
+      if (providerUrl.origin === 'https://globalbet.virtual-horizon.com' &&
+          providerUrl.pathname.startsWith('/engine/shop/feed/') && response.status() === 200 &&
+          requestEpochs.get(response.request()) === monitoringEpoch) {
+        providerAuthorization = response.request().headers().authorization || providerAuthorization;
+      }
       activity.lastAnyResponseAt = Date.now();
       if (isReliableHorizonSuccess(response)) {
         recordNetworkSuccess(getUrlPath(response.url()));
@@ -7045,6 +7251,10 @@ async function runBrowserSession() {
       until: 0,
     };
     feedEventsCapture = createFeedEventsCapture(page, {
+      leagueMonitor: { ingest: ingestLeagueFeed },
+      getMonitoringEpoch: () => monitoringEpoch,
+      getRequestEpoch: request => requestEpochs.get(request),
+      getRequestOrder: request => requestOrders.get(request),
       getCycle: () => cycle,
       lastPostedState: lastPostedFeedState,
       getPreviousCycleTiming: () => lastFeedCycleTiming,
@@ -7545,12 +7755,17 @@ async function runBrowserSession() {
       lastReloginAt = Date.now();
       console.log(`relogin-start reason=${sessionState.reason}`);
       try {
+        leagueMonitoringReadyAt = Infinity;
+        monitoringEpoch += 1;
+        leagueScheduler.reset();
+        providerAuthorization = null;
         if (recoveryOptions.reloadBeforeLogin && page && !page.isClosed?.()) {
           await page.reload({ waitUntil: 'domcontentloaded' }).catch((error) => {
             console.log(`relogin-reload-failed reason=${safeError(error)}`);
           });
         }
         await runConfiguredLogin(page, rl);
+        leagueMonitoringReadyAt = Date.now() + STARTUP_FEED_WARMUP_MS;
         console.log('relogin-success');
         clearAuthWarnings('relogin-success');
         recordNetworkSuccess('relogin-success');
@@ -7648,6 +7863,11 @@ async function runBrowserSession() {
   try {
     await launchRuntime();
     await runConfiguredLogin(page, rl);
+    leagueMonitoringReadyAt = Date.now() + STARTUP_FEED_WARMUP_MS;
+    leagueMonitorInterval = setInterval(() => {
+      void leagueScheduler.tick();
+      if (!cleanupStarted && !TEST_BLOCK_FEED_EVENTS) void liveStateMonitor.flush().catch(error => console.log(`LIVE-STATE-ERROR ${error.message}`));
+    }, 1000);
     await installTestFeedEventsBlocker(page);
     await resetFeedCaptureState('after-initial-login', {
       preservePendingWarmupFeed: true,
@@ -7657,7 +7877,7 @@ async function runBrowserSession() {
       await reloadShopPage(page);
     }
 
-    console.log(`Realtime source: ${FEED_PATH} (${FEED_EVENTS_SOURCE})`);
+    console.log(`Realtime sources: ${FEED_PATHS.join(', ')} (${FEED_EVENTS_SOURCE})`);
     console.log(`Feed-events soft refresh: ${Math.round(FEED_EVENTS_SOFT_REFRESH_MS / 1000)} seconds`);
     console.log(`Feed-events inactivity reload: ${Math.round(FEED_EVENTS_INACTIVITY_RELOAD_MS / 1000)} seconds`);
     console.log('[BrowserHealth] Virtual Horizon listener resumed');
@@ -8077,6 +8297,8 @@ async function shutdown(signal, exitCode = 0) {
 }
 
 async function main() {
+  // Importing parser/posting helpers in tests must not touch runtime state.
+  liveStateMonitor ??= initializeLiveStateMonitor();
   while (!shutdownRequested) {
     let delay = VH_RESTART_DELAY_MS;
     try {
@@ -8104,6 +8326,18 @@ if (require.main === module) {
 }
 
 module.exports = {
+  main,
+  shutdown,
+  postFeedEventsQueue,
+  postResultMonitorPayloadWithLedger,
+  parseFeedEventsBoards,
+  hasCompleteBoardResults,
+  buildFeedEventsQueuePayload,
+  postFeedEventsBoard,
+  getResultLedgerEntry,
+  registerResultLedgerEventBoard,
+  recordResultLedgerObservation,
+  classifyEventDetailPacket,
   classifyBrowserErrorPage,
   createBrowserErrorConfirmationState,
   detectBrowserErrorPage,

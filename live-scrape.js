@@ -1,14 +1,15 @@
 const { firefox } = require('playwright');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { LEAGUES } = require('./league-monitor');
+const { createProviderFeedClient } = require('./provider-feed-client');
 const readline = require('node:readline/promises');
 const { stdin: input, stdout: output } = require('node:process');
 
 const SHOP_URL = 'https://globalbet.virtual-horizon.com/client/shop.jsp';
-const EVENTS_URL = 'https://globalbet.virtual-horizon.com/engine/shop/feed/events?locale=en_US&gameType=FOOTBALL_LEAGUE&leagueId=21';
+const EVENTS_URL = 'https://globalbet.virtual-horizon.com/engine/shop/feed/events?locale=en_US&gameType=FOOTBALL_LEAGUE';
 const EVENT_DETAIL_URL = 'https://globalbet.virtual-horizon.com/engine/shop/feed/event';
 const DATA_DIR = 'data';
-const EVENTS_FILE = path.join(DATA_DIR, 'events-football-league-21.json');
 const EVENTS_DIR = path.join(DATA_DIR, 'events');
 
 function normalizeEventId(value) {
@@ -82,77 +83,45 @@ function extractEventIds(payload) {
   return [...eventIds];
 }
 
-function logErrorPreview(label, response) {
-  if (response.status >= 200 && response.status < 300) {
-    return;
-  }
-
-  console.log(`${label} error body preview:`);
-  console.log(response.body.slice(0, 500));
-}
-
-async function fetchFromPage(page, url) {
-  const response = await page.evaluate(async (requestUrl) => {
-    const fetchResponse = await fetch(requestUrl, {
-      credentials: 'include',
-      headers: {
-        accept: 'application/json, text/plain, */*',
-      },
-    });
-
-    return {
-      status: fetchResponse.status,
-      contentType: fetchResponse.headers.get('content-type'),
-      body: await fetchResponse.text(),
-    };
-  }, url);
-
-  try {
-    return {
-      ...response,
-      json: JSON.parse(response.body),
-    };
-  } catch {
-    throw new Error(`Expected JSON from ${url}, but received HTTP ${response.status}. Body: ${response.body.slice(0, 500)}`);
-  }
-}
-
-async function scrapeEvents(page) {
+async function scrapeEvents(client) {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.mkdir(EVENTS_DIR, { recursive: true });
 
-  const eventsResponse = await fetchFromPage(page, EVENTS_URL);
-  logErrorPreview('Events list', eventsResponse);
-  await fs.writeFile(EVENTS_FILE, `${JSON.stringify(eventsResponse.json, null, 2)}\n`, 'utf8');
+  for (const league of LEAGUES) {
+    const eventsResponse = await client.fetch(`${EVENTS_URL}&leagueId=${league.id}`);
+    const EVENTS_FILE = path.join(DATA_DIR, `events-football-league-${league.id}.json`);
+    await fs.writeFile(EVENTS_FILE, `${JSON.stringify(eventsResponse.json, null, 2)}\n`, 'utf8');
 
-  const eventIds = extractEventIds(eventsResponse.json);
-  console.log(`Events list HTTP ${eventsResponse.status}`);
-  console.log(`Events found: ${eventIds.length}`);
+    const eventIds = [...new Set([...extractEventIds(eventsResponse.json), ...Object.values(eventsResponse.json.events ?? {}).map(board => board.a).filter(Boolean)])];
+    console.log(`Events list HTTP ${eventsResponse.status}`);
+    console.log(`Events found: ${eventIds.length}`);
 
-  for (const eventId of eventIds) {
-    const detailUrl = `${EVENT_DETAIL_URL}/${eventId}?locale=en_US`;
-    const detailResponse = await fetchFromPage(page, detailUrl);
-    const detailFile = path.join(EVENTS_DIR, `${eventId}.json`);
+    for (const eventId of eventIds) {
+      const detailUrl = `${EVENT_DETAIL_URL}/${eventId}?locale=en_US&leagueId=${league.id}`;
+      const detailResponse = await client.fetch(detailUrl);
+      const detailFile = path.join(EVENTS_DIR, `${league.id}-${eventId}.json`);
 
-    logErrorPreview(`Event ${eventId}`, detailResponse);
-    await fs.writeFile(detailFile, `${JSON.stringify(detailResponse.json, null, 2)}\n`, 'utf8');
-    console.log(`Fetched event ${eventId}: HTTP ${detailResponse.status}`);
+      await fs.writeFile(detailFile, `${JSON.stringify(detailResponse.json, null, 2)}\n`, 'utf8');
+      console.log(`Fetched event ${eventId}: HTTP ${detailResponse.status}`);
+    }
   }
 }
 
 async function main() {
   const browser = await firefox.launch({ headless: false });
   const page = await browser.newPage();
+  const client = createProviderFeedClient(page);
   const rl = readline.createInterface({ input, output });
 
   try {
     await page.goto(SHOP_URL, { waitUntil: 'load' });
 
     await rl.question('Log in manually in the Firefox window, then press ENTER here to start scraping.');
-    await scrapeEvents(page);
+    await scrapeEvents(client);
     await rl.question('Scrape finished. Press ENTER here to close the browser.');
   } finally {
     rl.close();
+    client.dispose();
     await browser.close();
   }
 }
