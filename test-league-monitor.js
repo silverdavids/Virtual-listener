@@ -10,8 +10,8 @@ const {
 
 function feed(leagueId, eventId = 'shared-event', week = 1) {
   return { events: [{ a: eventId, d: '2026-09-06T12:00:00Z', e: '2026-09-06T12:03:00Z',
-    f: { b: { a: { a: { d: leagueId, a: leagueId === '21' ? 'Champions' : 'EPL' } },
-      c: { e: 9999, a: week, c: Array.from({ length: 10 }, (_, i) => ({ b: {
+    f: { b: { e: 9999, a: { a: { d: leagueId, a: leagueId === '21' ? 'Champions' : 'EPL' } },
+      c: { e: 1111, a: week, c: Array.from({ length: 10 }, (_, i) => ({ b: {
         a: `match-${i}`, i: { a: {
           b: { a: { a: `${leagueId}-home-${i}` }, b: { a: `${leagueId}-away-${i}` } },
           c: [{ name: '1X2', selections: [{ name: '1', odd: 2 }] }],

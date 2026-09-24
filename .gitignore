@@ -34,3 +34,8 @@ LiveSqlBridge/
 
 # Reviewed fixture required by the lifecycle tests.
 !test-fixtures/provider-progress.json
+
+# Private checkpoint and runtime capture directories.
+/captures/
+/runtime/
+/docs/evidence/

@@ -820,7 +820,7 @@ function parseFeedEventsBoardFromBoard(board, requestedLeagueId) {
   if (requestedLeagueId && providerLeagueId && String(providerLeagueId) !== String(requestedLeagueId)) {
     throw new Error(`league mismatch requested=${requestedLeagueId} payload=${providerLeagueId}`);
   }
-  const leagueNumber = board?.f?.b?.c?.e || providerLeagueId || null;
+  const leagueNumber = board?.f?.b?.e ?? null;
   const weekNumber = board?.f?.b?.c?.a ?? null;
   const boardMeta = {
     source: FEED_EVENTS_SOURCE,
@@ -5046,18 +5046,17 @@ function applyVisibleMetadataToCanonicalEvents(canonicalEvents, visibleFirstMatc
 
 function getVisibleMatchCacheKey(visibleFirstMatch) {
   return getEventDetailCacheKey({
+    leagueId: visibleFirstMatch?.leagueId,
+    providerEventId: visibleFirstMatch?.providerEventId,
     leagueNumber: visibleFirstMatch?.visibleLeague,
     weekNumber: visibleFirstMatch?.visibleWeek,
     firstMatch: getVisibleText(visibleFirstMatch),
   });
 }
 
-function getEventDetailCacheKey({ leagueNumber, weekNumber, firstMatch }) {
-  return [
-    String(leagueNumber ?? 'unknown'),
-    String(weekNumber ?? 'unknown'),
-    normalizeMatchToken(firstMatch),
-  ].join('|');
+function getEventDetailCacheKey({ leagueId, providerEventId }) {
+  // Display season/week/team labels cannot identify a cached provider event.
+  return leagueId && providerEventId ? leagueEventKey(leagueId, providerEventId) : null;
 }
 
 function getCanonicalFirstMatchText(canonicalEvents) {
@@ -5073,12 +5072,14 @@ function cacheParsedEventDetail(cycle, eventDetailCache, capture, parsedEventDet
   const firstEvent = parsedEventDetail.canonicalEvents[0] ?? null;
   const firstMatch = getCanonicalFirstMatchText(parsedEventDetail.canonicalEvents);
   const cacheKey = getEventDetailCacheKey({
+    leagueId: firstEvent?.leagueId,
+    providerEventId: parsedEventDetail.eventFeedId,
     leagueNumber: visibleFirstMatch?.visibleLeague,
     weekNumber: visibleFirstMatch?.visibleWeek,
     firstMatch,
   });
 
-  if (!firstEvent) {
+  if (!firstEvent || !cacheKey) {
     return;
   }
 
@@ -5331,7 +5332,7 @@ function validateFeedBoardPayload(boardPayload) {
     };
   }
 
-  if (!boardPayload.leagueNumber) {
+  if (!boardPayload.leagueId) {
     return {
       valid: false,
       reason: 'missing-league-id',
@@ -8344,4 +8345,5 @@ module.exports = {
   getBrowserErrorRestartDelay,
   inspectPageState,
   summarizeBoardMarkets,
+  getEventDetailCacheKey,
 };

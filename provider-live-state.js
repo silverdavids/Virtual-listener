@@ -11,7 +11,7 @@ const score = value => typeof value === 'number' && Number.isInteger(value) && v
 
 // Persist only fields needed to recover lifecycle and the provider's timeline.
 // Odds and unrelated provider/account data do not belong in this ledger.
-const snapshot = b => ({a:b.a,c:b.c,d:b.d,f:{b:{a:b.f.b.a,c:{a:b.f.b.c.a,b:b.f.b.c.b,
+const snapshot = b => ({a:b.a,c:b.c,d:b.d,f:{b:{a:b.f.b.a,e:b.f.b.e,c:{a:b.f.b.c.a,b:b.f.b.c.b,
   c:rows(b).map(m=>({b:{a:m.a,h:m.h,i:{a:{a:m.i?.a?.a,b:m.i?.a?.b,d:m.i?.a?.d,g:m.i?.a?.g}}}}))}}}});
 
 // Verified against provider codec EventDto/SubEventDto and UI Ai/xi/Li/Bi.
@@ -35,6 +35,7 @@ function parseLiveBoard(board, serverNow, requestedLeagueId) {
   return {
     provider: 'VirtualHorizon', source: 'provider-live-state', leagueId,
     leagueName: first?.i?.a?.a?.a || '', providerEventId: String(board.a),
+    leagueNumber: board?.f?.b?.e == null ? null : String(board.f.b.e),
     weekNumber: String(board?.f?.b?.c?.a ?? ''), state, providerStatus, availabilityStatus: matchStatus,
     scheduledStartAtUtc, startedAtUtc: state === 'UPCOMING' ? null : startedAtUtc || scheduledStartAtUtc,
     minute, observedAtUtc: new Date(serverNow).toISOString(),
