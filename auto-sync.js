@@ -78,7 +78,7 @@ const initializeLiveStateMonitor = () => createLiveStateMonitor({
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload), signal: AbortSignal.timeout(15000),
     });
-    if (!response.ok) throw new Error(`live state HTTP ${response.status}`);
+    if (!response.ok) throw await require('./live-state-post-error').liveStatePostError(response, payload);
   },
 });
 const CYCLE_POLL_SECONDS = Math.min(3, Math.max(2, parseEnvSeconds(process.env.CYCLE_POLL_SECONDS, 3)));
@@ -798,6 +798,7 @@ function mapFeedMatch(row, boardMeta) {
     sport: 'FOOTBALL',
     leagueId: String(boardMeta.providerLeagueId ?? ''),
     leagueNumber: String(boardMeta.leagueNumber ?? ''),
+    scenePolicy: boardMeta.scenePolicy ?? null,
     providerLeagueId: String(boardMeta.providerLeagueId ?? ''),
     leagueName: boardMeta.leagueName,
     homeTeam,
@@ -832,6 +833,7 @@ function parseFeedEventsBoardFromBoard(board, requestedLeagueId) {
     providerLeagueId: providerLeagueId === null || providerLeagueId === undefined ? null : String(providerLeagueId),
     weekNumber: weekNumber === null || weekNumber === undefined ? null : String(weekNumber),
     leagueNumber: leagueNumber === null || leagueNumber === undefined ? null : String(leagueNumber),
+    scenePolicy: board?.f?.b?.d ?? null,
     startTime: board?.d ?? null,
     endTime: board?.e ?? board?.endTime ?? board?.finishTime ?? null,
     reliableEndAt: toFeedIsoTime(board?.finishTime ?? board?.endTime ?? null),
@@ -973,6 +975,7 @@ function buildFeedEventsQueuePayload(boardPayloads, capturedAt) {
       return {
         leagueId,
         leagueNumber: boardPayload.leagueNumber,
+        scenePolicy: boardPayload.scenePolicy ?? null,
         availabilityStatus: boardPayload.availabilityStatus,
         providerStatus: boardPayload.providerStatus,
         providerEventId: boardPayload.providerEventId,

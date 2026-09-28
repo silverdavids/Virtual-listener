@@ -34,6 +34,7 @@ LiveSqlBridge/
 
 # Reviewed fixture required by the lifecycle tests.
 !test-fixtures/provider-progress.json
+!test-fixtures/champions-channels.json
 
 # Private checkpoint and runtime capture directories.
 /captures/

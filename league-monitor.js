@@ -97,11 +97,17 @@ function createLeagueMonitor({ parseBoards, postBoard, postQueue, buildQueue, is
 function createLeagueRefreshScheduler({ refreshLeague, pollResults, isReady = () => true,
   intervalMs = 5000, now = Date.now, onError = () => {} }) {
   let generation = 0;
+  let clockGeneration=require('./provider-clock').generation();
   const states = new Map(LEAGUES.map(league => [league.id, {
     feed: { nextAt: 0, inFlight: null }, results: { nextAt: 0, inFlight: null },
   }]));
   function tick() {
     if (!isReady()) return Promise.resolve([]);
+    const nextClockGeneration=require('./provider-clock').generation();
+    if(nextClockGeneration!==clockGeneration){
+      clockGeneration=nextClockGeneration;
+      for(const state of states.values())for(const kind of ['feed','results'])state[kind].nextAt=0;
+    }
     const pending = [];
     for (const league of LEAGUES) {
       for (const [kind, action] of [['feed', refreshLeague], ['results', pollResults]]) {

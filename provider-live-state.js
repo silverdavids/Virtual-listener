@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { normalizeProviderTimestamp: iso } = require('./provider-timestamp');
+const {createObservationClock,bounded}=require('./provider-clock');
 const keyOf = b => JSON.stringify([String(b.leagueId), String(b.providerEventId)]);
 const rank = { UPCOMING: 0, LIVE: 1, FINISHED: 2 };
 const rows = b => Object.values(b?.f?.b?.c?.c || {}).map(row => row.b || row);
@@ -11,22 +12,23 @@ const score = value => typeof value === 'number' && Number.isInteger(value) && v
 
 // Persist only fields needed to recover lifecycle and the provider's timeline.
 // Odds and unrelated provider/account data do not belong in this ledger.
-const snapshot = b => ({a:b.a,c:b.c,d:b.d,f:{b:{a:b.f.b.a,e:b.f.b.e,c:{a:b.f.b.c.a,b:b.f.b.c.b,
+const snapshot = b => ({a:b.a,c:b.c,d:b.d,f:{b:{a:b.f.b.a,d:b.f.b.d,e:b.f.b.e,c:{a:b.f.b.c.a,b:b.f.b.c.b,
   c:rows(b).map(m=>({b:{a:m.a,h:m.h,i:{a:{a:m.i?.a?.a,b:m.i?.a?.b,d:m.i?.a?.d,g:m.i?.a?.g}}}}))}}}});
 
 // Verified against provider codec EventDto/SubEventDto and UI Ai/xi/Li/Bi.
 // e/g are nextTransitionTime, NOT end times. Never expose future fragment scores.
 function parseLiveBoard(board, serverNow, requestedLeagueId) {
+  if(!validTime(serverNow))return null;
   const matches = rows(board), first = matches[0];
   const leagueId = String(board?.f?.b?.a?.a?.d ?? board?.f?.b?.a?.d ?? requestedLeagueId ?? '');
   if (!['21','78'].includes(leagueId) || requestedLeagueId && leagueId !== String(requestedLeagueId) || !board.a || matches.length !== 10) return null;
   const scheduledStartAtUtc = iso(board.d);
+  if(!scheduledStartAtUtc)return null;
   const providerStatus = board.c;
   const matchStatus = board?.f?.b?.c?.b;
   const finished = ['RESULTS','COMPLETED'].includes(providerStatus) || ['DISPLAY_RESULTS','COMPLETED'].includes(matchStatus);
   const startedAtUtc = iso(first?.h?.c);
-  const hasStarted = providerStatus === 'PROGRESS' || matchStatus === 'RACING' || Boolean(startedAtUtc) ||
-    scheduledStartAtUtc && Date.parse(scheduledStartAtUtc) <= serverNow;
+  const hasStarted = providerStatus === 'PROGRESS' || matchStatus === 'RACING' || Boolean(startedAtUtc);
   const state = finished ? 'FINISHED' : hasStarted ? 'LIVE' : 'UPCOMING';
   const firstDuration = duration(first), start = Date.parse(startedAtUtc);
   const elapsed = Number.isFinite(start) ? Math.max(0, serverNow - start) : 0;
@@ -36,7 +38,9 @@ function parseLiveBoard(board, serverNow, requestedLeagueId) {
     provider: 'VirtualHorizon', source: 'provider-live-state', leagueId,
     leagueName: first?.i?.a?.a?.a || '', providerEventId: String(board.a),
     leagueNumber: board?.f?.b?.e == null ? null : String(board.f.b.e),
-    weekNumber: String(board?.f?.b?.c?.a ?? ''), state, providerStatus, availabilityStatus: matchStatus,
+    scenePolicy: board?.f?.b?.d ?? null,
+    weekNumber: String(board?.f?.b?.c?.a ?? ''), state, providerLifecycle:state, providerStatus, availabilityStatus: matchStatus,
+    bettingOpen:state==='UPCOMING' && matchStatus==='ACCEPTING_TICKETS' && Date.parse(scheduledStartAtUtc)>serverNow,
     scheduledStartAtUtc, startedAtUtc: state === 'UPCOMING' ? null : startedAtUtc || scheduledStartAtUtc,
     minute, observedAtUtc: new Date(serverNow).toISOString(),
     available: providerStatus !== 'CANCELLED',
@@ -97,7 +101,11 @@ function validateLedger(data) {
   return result;
 }
 
-function createLiveStateMonitor({ post, file, now = Date.now, reconciliationMs = 15000, log = console.log, io = fs }) {
+function createLiveStateMonitor({ post, file, now = Date.now, monotonic, clock, reconciliationMs = 15000, log = console.log, io = fs }) {
+  // Tests injecting only now retain deterministic elapsed time. Production always uses performance.now.
+  clock=clock || createObservationClock({wall:now,...(monotonic?{monotonic}:now!==Date.now?{monotonic:now}:{}),log});
+  const anchors=new Map(); // process-local; a restored entry needs a fresh provider response
+  const futureSkew=bounded(process.env.VH_TIMESTAMP_FUTURE_SKEW_MS,30000,1000,60000);
   let entries = new Map();
   let persistenceBlocked = false;
   if (file) {
@@ -149,8 +157,9 @@ function createLiveStateMonitor({ post, file, now = Date.now, reconciliationMs =
     }
   };
   function observe(json, leagueId) {
+    const received=clock.sample();
     const serverTime = Number(json?.header?.serverTime);
-    if (!Number.isFinite(serverTime)) return;
+    if (!validTime(serverTime)) return;
     const boards = json.events ? Object.values(json.events) : json.event ? [json.event] : [];
     const seen = new Set();
     for (const raw of boards) {
@@ -160,9 +169,17 @@ function createLiveStateMonitor({ post, file, now = Date.now, reconciliationMs =
       seen.add(key);
       if (old && serverTime <= Math.max(old.serverTime,old.removedAt || 0)) continue;
       if (old && old.raw.c !== 'ANNOUNCEMENT' && raw.c === 'ANNOUNCEMENT') continue;
-      // A delayed prematch snapshot must not replace live score timelines.
-      if (old && rank[payload.state] < rank[old.state]) continue;
-      entries.set(key, { ...old, raw:snapshot(raw), serverTime, receivedAt: now(), state: payload.state, available: payload.available });
+      // Only a demonstrably time-inferred, unscored legacy LIVE may recover.
+      const previous=old && parseLiveBoard(old.raw,old.serverTime,leagueId);
+      const recovery=old?.state==='LIVE' && previous?.state==='UPCOMING' && payload.state==='UPCOMING' &&
+        Date.parse(payload.scheduledStartAtUtc)>serverTime && old.raw.d===raw.d &&
+        !rows(old.raw).some(m=>m.i?.a?.d || fragments(m).length);
+      if (old && rank[payload.state] < rank[old.state] && !recovery) continue;
+      if(old && old.raw.d!==raw.d){log(`LIVE-STATE-REJECTED league=${leagueId} event=${raw.a} reason=event_start_changed`);continue;}
+      if(recovery)log(`LIVE-STATE-RECOVERED league=${leagueId} event=${raw.a} reason=poisoned_unscored_live`);
+      const anchor=anchors.get(key);
+      anchors.set(key,{mono:received.mono,source:serverTime,observed:Math.max(serverTime,anchor?.observed || 0)});
+      entries.set(key, { ...old, raw:snapshot(raw), serverTime, receivedAt: serverTime, state: payload.state, available: payload.available });
     }
     if (json.events && leagueId) {
       for (const [key, entry] of entries) {
@@ -179,25 +196,38 @@ function createLiveStateMonitor({ post, file, now = Date.now, reconciliationMs =
     if (busy) return;
     busy = true;
     try {
+      const sampled=clock.sample();
       await Promise.all([...entries].map(async ([key, entry]) => {
-        if (now() < (entry.nextPostAt || 0)) return;
+        const anchor=anchors.get(key);
+        if(!anchor)return; // never extrapolate a persisted wall-clock pair after restart
+        const tick=sampled.mono;
+        if (tick < (anchor.nextPostAt || 0)) return;
         const serverNow = entry.available === false && entry.removedAt ? entry.removedAt :
-          entry.serverTime + Math.max(0, now() - entry.receivedAt);
+          anchor.source + Math.max(0,tick-anchor.mono);
+        if(!validTime(serverNow)){log('LIVE-STATE-REJECTED reason=invalid_reference_time');return;}
         const payload = parseLiveBoard(entry.raw, serverNow, JSON.parse(key)[0]);
         if (!payload) return;
         if (rank[entry.state] > rank[payload.state]) payload.state = entry.state;
         entry.state = payload.state;
         payload.sourceUpdatedAtUtc = new Date(Math.max(entry.serverTime,entry.available===false ? entry.removedAt || 0 : 0)).toISOString();
+        payload.observedAtUtc=new Date(Math.max(anchor.observed,anchor.source+Math.max(0,tick-anchor.mono))).toISOString();
+        const source=Date.parse(payload.sourceUpdatedAtUtc),observed=Date.parse(payload.observedAtUtc);
+        if(!payload.leagueId || !payload.providerEventId || keyOf(payload)!==key || !Number.isFinite(observed) || !Number.isFinite(source) ||
+          observed>anchor.source+Math.max(0,tick-anchor.mono)+futureSkew || source<anchor.source ||
+          Date.parse(payload.scheduledStartAtUtc)!==entry.raw.d){
+          log(`LIVE-STATE-REJECTED league=${payload.leagueId} event=${payload.providerEventId} reason=invalid_timestamp_identity`);return;
+        }
+        anchor.observed=observed;
         payload.available = entry.available;
         const hash = JSON.stringify({ ...payload, observedAtUtc: undefined, sourceUpdatedAtUtc: undefined });
         if (hash === entry.hash && (payload.state === 'FINISHED' || payload.available === false ||
-            now() - (entry.lastPostAt || 0) < reconciliationMs)) return;
+            tick - (anchor.lastPostAt ?? -Infinity) < reconciliationMs)) return;
         try {
           await post(payload);
-          entry.hash = hash; entry.lastPostAt = now();
+          entry.hash = hash; entry.lastPostAt = observed;anchor.lastPostAt=tick;
           log(`LIVE-STATE-POSTED league=${payload.leagueId} event=${payload.providerEventId} state=${payload.state} minute=${payload.minute}`);
         } catch (e) {
-          entry.nextPostAt = now() + 5000;
+          anchor.nextPostAt = tick + 5000;
           log(`LIVE-STATE-RETRY league=${payload.leagueId} event=${payload.providerEventId} reason=${e.message}`);
         }
       }));

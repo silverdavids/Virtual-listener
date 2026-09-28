@@ -8,6 +8,13 @@ const fixture = require('./test-fixtures/provider-progress.json');
 const raw = () => structuredClone(fixture.events[0]);
 const start = fixture.events[0].f.b.c.c[0].b.h.c;
 
+test('provider scene policy survives persisted lifecycle snapshots',async t=>{
+  const h=persistenceHarness(t),monitor=h.make(),payload=structuredClone(fixture);
+  payload.events[0].f.b.d='SCENE_6';
+  monitor.observe(payload,'78');await monitor.flush();
+  assert.equal([...h.make().entries.values()][0].raw.f.b.d,'SCENE_6');
+});
+
 function persistenceHarness(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vh-persistence-'));
   const file = path.join(dir, 'state.json');
@@ -156,7 +163,8 @@ test('exact planned UTC start closes delayed announcement without expiring its d
   const b=raw(); b.c='ANNOUNCEMENT'; b.f.b.c.b='ACCEPTING_TICKETS';
   b.f.b.c.c.forEach(r=>{r.b.h={}; r.b.i.a.g={a:[]};});
   assert.equal(parseLiveBoard(b,b.d-1,'78').state,'UPCOMING');
-  assert.equal(parseLiveBoard(b,b.d,'78').state,'LIVE');
+  assert.equal(parseLiveBoard(b,b.d,'78').state,'UPCOMING');
+  assert.equal(parseLiveBoard(b,b.d,'78').bettingOpen,false);
   assert.equal(parseLiveBoard(b,b.d+1,'78').matches.length,10);
 });
 test('finished phase uses final scores and never treats future fragment outcomes as current',()=>{
